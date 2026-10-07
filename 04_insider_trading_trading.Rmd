@@ -1,0 +1,493 @@
+---
+title: "Insider Transactions: What Separates Next-Day Winners from Losers?"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    toc: true
+params:
+  data_file: "insider_daily_dataset.rds"                     # Form 4 Insider Trading data set
+  gfd_file: "F:/EquityPrediction/GFD.csv"                    # Global Factor Data data set
+  prices_file: "F:/CRSP/daily_prices_20000101_20250504.csv"  # CRSP daily returns data set
+  ret_col: "ret_t1_oc_w"       # use winsorized return column
+  max_rank: 8000               # maximum market cap rank of stocks considered 
+  min_price: 5                 # minimum unadjusted share price (USD)
+  min_mcap: 4e8                # minimum market cap (USD)
+  train_years: 5               # years of events in each training window of the rolling logit model
+  test_years: 1                # year(s) predicted before the window moves forward
+  max_gfd_age_days: 30         # GFD EOM must be at most this many days before the event (base: 45)
+  top_pct: 40                  # "top" = events in the model's highest top_pct% of predictions
+  bottom_pct: 40               # "bottom" = events in the lowest bottom_pct% (top_pct + bottom_pct <= 100)
+  max_hold_days: 0             # 0 = hold until the next signal (open t to open t+N_Signal); N = move to cash after N days without one
+  trade_mode: "hold"           # "hold" = hold positions until replaced (overnight included)
+                               # "intraday" = buy the current selection in the opening auction and sell it all in the
+                               #   closing auction, every day (never held overnight; fills at official open/close)
+---
+
+<!--
+EVENTS: each stock-day t in the filtered universe (same filters as 04_insider_holding_portfolios.Rmd) where ins_buy_gt_sell == 1. Outcome: next-day open-to-close return, and its excess over the equal-weighted universe that day. "Up" = excess return > 0.
+
+FUNDAMENTALS: JKP characteristics from GFD (GLOBAL_FACTOR_DATA_PREP.Rmd), taken from the last EOM before day t. GFD's accounting items are already point-in-time (attached by report date rdq). GFD's forward-return columns are never read.
+
+VALUATION: price-scaled ratios computed here with day-t market cap (known at the day-t close), plus a residual income intrinsic value (JKP's ival_me).
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(data.table)
+library(ggplot2)
+say  <- function(...) cat(paste0(...), "\n\n", sep = "")
+show <- function(x, caption = NULL, ...) {          # plain console-style table
+  if (!is.null(caption)) cat(caption, "\n", sep = "")
+  print(as.data.table(x), nrows = 1e5, row.names = FALSE)
+  cat("\n")
+}
+```
+
+## 1. Insider buy events
+
+```{r events}
+dt <- readRDS(params$data_file)
+setDT(dt)
+dt[, ret := as.numeric(get(params$ret_col))]
+dt[, company_mcap := as.numeric(company_mcap)]
+
+univ <- dt[mcap_rank < as.numeric(params$max_rank) & !is.na(ret) & prccd >= as.numeric(params$min_price) & company_mcap >= as.numeric(params$min_mcap)]
+univ[, bench := mean(ret), by = datadate] # equal-weighted universe return that day
+ev <- univ[ins_buy_gt_sell == 1L] # event data.table
+ev[, `:=`(excess = ret - bench, up = as.integer(ret - bench > 0), permno = as.integer(LPERMNO))]
+rm(dt); invisible(gc())
+
+say(sprintf("Events: %s insider-buy stock-days, %s companies, %s to %s. Up (beat the universe next day): %.1f%%.",
+            format(nrow(ev), big.mark = ","), format(uniqueN(ev$cik), big.mark = ","),
+            min(ev$datadate), max(ev$datadate), 100 * mean(ev$up)))
+show(ev[, .(Events = .N, `% up` = round(100 * mean(up), 1), `Mean excess (bp)` = round(1e4 * mean(excess), 1)),
+        by = .(Year = as.character(year(datadate)))][order(Year)],
+     caption = "Events by year (years with few events reflect missing opening prices in the price file)")
+```
+
+## 2. Fundamentals as of the day before
+
+```{r fundamentals}
+# Columns wanted from GFD (JKP names). Only those present are read.
+want <- c(
+  # levels for valuation (USD millions)
+  "assets", "sales", "book_equity", "net_income",
+  # ratios used to back out other levels
+  "ocf_at", "ebitda_at", "debt_at", "cash_at", "ni_be", "div_ni",
+  # quality / profitability
+  "gp_at", "ope_be", "f_score", "o_score", "oaccruals_at", "ni_inc8q",
+  # growth / investment
+  "at_gr1", "sale_gr1", "niq_su", "saleq_su",
+  # risk
+  "beta_252d", "ivol_capm_252d", "rvol_21d",
+  # momentum / reversal / price level
+  "ret_1_0", "ret_12_1", "ret_6_1", "prc_highprc_252d",
+  # liquidity
+  "dolvol_126d", "turnover_126d", "ami_126d",
+  # issuance / payout
+  "chcsho_12m", "eqnpo_at")
+hdr <- names(fread(params$gfd_file, nrows = 0))
+if (!all(c("permno", "eom") %in% hdr)) stop("GFD file needs permno and eom columns.")
+got <- intersect(want, hdr)
+missing_cols <- setdiff(want, hdr)
+gfd <- fread(params$gfd_file, select = c("permno", "eom", got), showProgress = FALSE)
+gfd[, `:=`(permno = as.integer(permno), eom = as.IDate(eom))]
+num <- setdiff(names(gfd), c("permno", "eom"))
+gfd[, (num) := lapply(.SD, as.numeric), .SDcols = num]
+gfd <- unique(gfd[permno %in% ev$permno], by = c("permno", "eom"))
+setkey(gfd, permno, eom)
+
+# Last month-end strictly before day t: roll onto (t - 1)
+ev[, jdate := as.IDate(datadate) - 1L]
+ev <- gfd[ev, on = .(permno, eom = jdate), roll = TRUE]
+setnames(ev, "eom", "jdate")
+ev[, gfd_eom := gfd[ev, on = .(permno, eom = jdate), roll = TRUE, x.eom]]
+ev[is.na(gfd_eom) | as.integer(datadate - gfd_eom) > params$max_gfd_age_days, (num) := NA_real_]
+
+say(sprintf("Matched to fundamentals (month-end within %d days before the event): %.1f%% of events. Read %d of %d requested GFD columns%s.",
+            params$max_gfd_age_days, 100 * mean(!is.na(ev$gfd_eom) & as.integer(ev$datadate - ev$gfd_eom) <= params$max_gfd_age_days),
+            length(got), length(want),
+            if (length(missing_cols)) paste0(" (not in GFD: ", paste(missing_cols, collapse = ", "), ")") else ""))
+```
+
+```{r valuation}
+col_or_na <- function(v) if (v %in% names(ev)) ev[[v]] else rep(NA_real_, nrow(ev))
+me   <- ev$company_mcap / 1e6                              # day-t market cap, USD millions (Compustat units)
+at   <- col_or_na("assets")
+be   <- col_or_na("book_equity")
+ni   <- col_or_na("net_income")
+sale <- col_or_na("sales")
+ocf    <- col_or_na("ocf_at") * at
+ebitda <- col_or_na("ebitda_at") * at
+debt   <- col_or_na("debt_at") * at
+cash   <- col_or_na("cash_at") * at
+ev_val <- me + debt - cash                                  # enterprise value
+pos <- function(num, den) fifelse(!is.na(den) & den > 0, num / den, NA_real_)
+
+# Residual-income intrinsic value (Frankel & Lee 1998, as in JKP's ival_me):
+#   IV = BE + (ROE - r)/(1 + r) * BE + (ROE - r)/((1 + r) * r) * BE1,  BE1 = BE * (1 + (1 - k) * ROE)
+# r = 12% cost of equity, k = payout ratio clipped to [0, 1]
+r   <- 0.12
+roe <- col_or_na("ni_be")
+k   <- pmin(pmax(fcoalesce(col_or_na("div_ni"), 0), 0), 1)
+be1 <- be * (1 + (1 - k) * roe)
+iv  <- fifelse(!is.na(be) & be > 0 & !is.na(roe), be + (roe - r) / (1 + r) * be + (roe - r) / ((1 + r) * r) * be1, NA_real_)
+
+ev[, `:=`(
+  val_be_me     = pos(be, me),        # book-to-market
+  val_ni_me     = pos(ni, me),        # earnings yield
+  val_sale_me   = pos(sale, me),      # sales-to-price
+  val_ocf_me    = pos(ocf, me),       # cash-flow yield
+  val_ebitda_ev = pos(ebitda, ev_val),# EBITDA / enterprise value
+  val_ival_me   = pos(iv, me),        # intrinsic value / price (> 1 = looks cheap)
+  log_mcap      = log(me),
+  ins_buy_mcap  = ins_buy_dollar / company_mcap,
+  ins_n_buyers  = as.numeric(ins_n_buyers),
+  ins_officer   = as.numeric(ins_n_officer > 0),
+  ins_director  = as.numeric(ins_n_director > 0),
+  ins_tenpct    = as.numeric(ins_n_tenpct > 0)
+)]
+```
+
+## 3. Winners vs losers, one feature at a time
+
+```{r features}
+groups <- list(
+  Valuation  = c("val_be_me", "val_ni_me", "val_sale_me", "val_ocf_me", "val_ebitda_ev", "val_ival_me"),
+  Quality    = c("gp_at", "ope_be", "ni_be", "f_score", "o_score", "oaccruals_at", "ni_inc8q"),
+  Growth     = c("at_gr1", "sale_gr1", "niq_su", "saleq_su"),
+  Risk       = c("beta_252d", "ivol_capm_252d", "rvol_21d"),
+  Momentum   = c("ret_1_0", "ret_6_1", "ret_12_1", "prc_highprc_252d"),
+  `Size & liquidity` = c("log_mcap", "dolvol_126d", "turnover_126d", "ami_126d"),
+  Issuance   = c("chcsho_12m", "eqnpo_at"),
+  Insider    = c("ins_buy_mcap", "ins_n_buyers", "ins_officer", "ins_director", "ins_tenpct"))
+feat_map <- rbindlist(lapply(names(groups), function(g) data.table(Group = g, Feature = groups[[g]])))
+feat_map <- feat_map[Feature %in% names(ev)]
+feat_map <- feat_map[sapply(Feature, function(f) sum(!is.na(ev[[f]])) >= 50)]
+FEATS <- feat_map$Feature
+
+# AUC: probability that a randomly chosen "up" event has a higher value than a "down" one (0.5 = no information)
+auc <- function(x, y) {
+  ok <- !is.na(x) & !is.na(y); x <- x[ok]; y <- y[ok]
+  n1 <- sum(y == 1); n0 <- sum(y == 0)
+  if (n1 == 0 || n0 == 0) return(c(NA_real_, NA_real_))
+  a <- (sum(frank(x)[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+  q1 <- a / (2 - a); q2 <- 2 * a^2 / (1 + a)                       # Hanley-McNeil standard error
+  c(a, sqrt((a * (1 - a) + (n1 - 1) * (q1 - a^2) + (n0 - 1) * (q2 - a^2)) / (n1 * n0)))
+}
+
+uni <- rbindlist(lapply(FEATS, function(f) {
+  x <- ev[[f]]; a <- auc(x, ev$up)
+  data.table(Feature = f, `N` = sum(!is.na(x)),
+             `Median, up` = signif(median(x[ev$up == 1], na.rm = TRUE), 3),
+             `Median, down` = signif(median(x[ev$up == 0], na.rm = TRUE), 3),
+             AUC = round(a[1], 3), `z` = round((a[1] - 0.5) / a[2], 2))
+}))
+uni <- merge(feat_map, uni, by = "Feature")[order(-abs(z))]
+show(uni, caption = "Each feature: median for next-day winners vs losers, and AUC (0.5 = no difference). |z| > 2 is roughly significant at 5%")
+say(sprintf("With %d features tested, about %.0f would show |z| > 2 by chance alone. Read the table for patterns that are both significant and make economic sense, not for individual stars.",
+            length(FEATS), 0.05 * length(FEATS)))
+```
+
+### Next-day excess return by quintile
+
+Each feature is ranked within year among the events (so a value's meaning doesn't drift with market-wide valuation levels), then split into fifths. Q1 = lowest values.
+
+```{r quintiles}
+rank01 <- function(x) { r <- frank(x, na.last = "keep"); (r - 0.5) / sum(!is.na(x)) }
+ev[, yr := year(datadate)]
+qt <- rbindlist(lapply(FEATS, function(f) {
+  q <- ev[, .(q = ceiling(5 * rank01(get(f))), excess), by = yr][!is.na(q)]
+  if (uniqueN(q$q) < 5) return(NULL)
+  m <- q[, .(m = mean(excess)), keyby = q]
+  a <- q[q == 5, excess]; b <- q[q == 1, excess]
+  data.table(Feature = f, Q1 = m$m[1], Q2 = m$m[2], Q3 = m$m[3], Q4 = m$m[4], Q5 = m$m[5],
+             `Q5 - Q1` = mean(a) - mean(b),
+             t = (mean(a) - mean(b)) / sqrt(var(a) / length(a) + var(b) / length(b)))
+}))
+bp <- c("Q1", "Q2", "Q3", "Q4", "Q5", "Q5 - Q1")
+qt[, (bp) := lapply(.SD, function(v) round(1e4 * v, 1)), .SDcols = bp][, t := round(t, 2)]
+qt <- merge(feat_map, qt, by = "Feature")[order(-abs(t))]
+show(qt, caption = "Mean next-day excess return (basis points) by within-year quintile of each feature")
+```
+
+## 4. Rolling model: train 5 years, predict the next year
+
+A logistic regression of "up" on all features at once, re-estimated in a walk-forward loop: train on `r params$train_years` years of events, predict the following `r params$test_years` year(s), then move the window forward and repeat. Every prediction is made by a model that never saw that year.
+
+Features are converted to percentiles (0 to 1) of the **training window's** distribution, which makes coefficients comparable and outliers harmless; missing values are set to the middle (0.5). Test events are scored against the training distribution, never against each other, so no future values leak in.
+
+```{r rolling-model}
+TRAIN_Y <- as.integer(params$train_years); STEP <- as.integer(params$test_years)
+TOP <- params$top_pct; BOT <- params$bottom_pct
+if (TOP <= 0 || BOT <= 0 || TOP + BOT > 100) stop("Need top_pct > 0, bottom_pct > 0 and top_pct + bottom_pct <= 100.")
+
+# Percentile of x within the training values (NA -> 0.5)
+pct_of <- function(train_x, x) {
+  tx <- train_x[!is.na(train_x)]
+  if (!length(tx)) return(rep(0.5, length(x)))
+  fcoalesce(ecdf(tx)(x), 0.5)
+}
+
+base <- ev[, c("yr", "up", "excess", "datadate", "t1_date", "ret", "permno", FEATS), with = FALSE]
+years <- sort(unique(base$yr))
+starts <- seq(min(years) + TRAIN_Y, max(years), by = STEP)
+oos <- list(); wins <- list(); coefs <- list()
+
+for (y0 in starts) {
+  tr <- base[yr >= y0 - TRAIN_Y & yr < y0]
+  te <- base[yr >= y0 & yr < y0 + STEP]
+  if (nrow(tr) < 200 || !nrow(te)) next
+  use <- FEATS[sapply(FEATS, function(f) uniqueN(tr[[f]], na.rm = TRUE) > 1)]
+  trx <- tr[, c("up", use), with = FALSE]
+  tex <- copy(te)
+  for (f in use) {
+    set(trx, j = f, value = pct_of(tr[[f]], tr[[f]]))
+    set(tex, j = f, value = pct_of(tr[[f]], te[[f]]))
+  }
+  fit <- suppressWarnings(glm(reformulate(use, "up"), data = trx, family = binomial()))
+  p_tr <- predict(fit, type = "response")
+  tex[, p_up := suppressWarnings(predict(fit, newdata = tex, type = "response"))]
+
+  # Group cutoffs from the TRAINING predictions only
+  cut_top <- quantile(p_tr, 1 - TOP / 100, names = FALSE)
+  cut_bot <- quantile(p_tr, BOT / 100, names = FALSE)
+  qcuts   <- quantile(p_tr, c(0.2, 0.4, 0.6, 0.8), names = FALSE)
+  tex[, `:=`(grp = fifelse(p_up >= cut_top, "top", fifelse(p_up < cut_bot, "bottom", "middle")),
+             pq  = findInterval(p_up, qcuts) + 1L)]
+
+  wlab <- sprintf("%d-%d", y0 - TRAIN_Y, y0 - 1)
+  tlab <- if (STEP == 1) as.character(y0) else sprintf("%d-%d", y0, min(y0 + STEP - 1, max(years)))
+  oos[[length(oos) + 1]] <- tex[, .(datadate, t1_date, permno, ret, excess, up, p_up, grp, pq, test = tlab)]
+  wins[[length(wins) + 1]] <- data.table(
+    Train = wlab, Test = tlab, `Train events` = nrow(tr), `Test events` = nrow(te),
+    `Test AUC` = round(auc(tex$p_up, tex$up)[1], 3),
+    `Top: excess bp` = round(1e4 * tex[grp == "top", mean(excess)], 1),
+    `Bottom: excess bp` = round(1e4 * tex[grp == "bottom", mean(excess)], 1))
+  co <- as.data.table(summary(fit)$coefficients, keep.rownames = "Feature")[Feature != "(Intercept)"]
+  setnames(co, c("Feature", "Coef", "SE", "z", "p"))
+  coefs[[length(coefs) + 1]] <- co[, Test := tlab]
+}
+oos <- rbindlist(oos); wins <- rbindlist(wins); coefs <- rbindlist(coefs)
+
+if (!nrow(oos)) {
+  say(sprintf("Not enough events for a %d-year training window (need at least 200 events per window).", TRAIN_Y))
+} else {
+  a_all <- auc(oos$p_up, oos$up)
+  say(sprintf("Out-of-sample: %s events, %s to %s, %d windows. Overall out-of-sample AUC %.3f (+/- %.3f); 0.5 = no better than chance.",
+              format(nrow(oos), big.mark = ","), min(oos$datadate), max(oos$datadate), nrow(wins),
+              a_all[1], 1.96 * a_all[2]))
+  show(wins, caption = sprintf("Each window: test-year AUC, and mean next-day excess return of the model's top %g%% and bottom %g%%", TOP, BOT))
+
+  stab <- coefs[, .(Windows = .N, `Median coef` = round(median(Coef), 3),
+                    `% windows > 0` = round(100 * mean(Coef > 0)),
+                    `Windows with |z| > 2` = sum(abs(z) > 2)), by = Feature]
+  stab <- merge(feat_map, stab, by = "Feature")[order(-abs(`% windows > 0` - 50), -`Windows with |z| > 2`)]
+  show(stab, caption = "Coefficient stability across windows. A feature that matters should keep the same sign (near 0% or 100%) in most windows")
+
+  show(oos[, .(Events = .N, `% up` = round(100 * mean(up), 1), `Mean excess (bp)` = round(1e4 * mean(excess), 1)),
+           keyby = .(`Predicted quintile (5 = most likely up)` = pq)],
+       caption = "All out-of-sample events by predicted quintile (quintile cutoffs from each window's training predictions)")
+}
+```
+
+## 5. Cumulative returns (out of sample, positions held until replaced)
+
+Each portfolio behaves like a real book. When new insider-buy stocks are selected on day t, the current holdings are sold at the open of t+1 (earning their overnight move) and the new selection is bought at the same open (earning open-to-close that day). On days with no new selection the portfolio **keeps its positions**, earning close-to-close returns, overnight included. Positions are equal-weighted. `max_hold_days` in the header can cap how long positions are held without a new signal (0 = no cap).
+
+"Model top" and "Model bottom" are the events the model rated most and least likely to beat the market (sizes set by `top_pct` / `bottom_pct`); each window's cutoffs come from its **training** predictions, so the choice of trades uses no future information. All returns here come straight from the price file (split-adjusted, price only, no filled-in opens). Where the t+1 open is missing, the switch happens at the t+1 close instead. Returns are before trading costs.
+
+**`trade_mode: "intraday"`** changes how positions are held: every trading day the portfolio buys its
+current selection (the newest signals, or the previous selection if none arrived) in the **opening
+auction** and sells all of it in the **closing auction**. Nothing is held overnight, and every fill is
+at an official auction price (`prcod` / `prccd`). Stocks without an opening price that day are skipped
+that day. The benchmark then uses the universe's open-to-close return, so the comparison stays like
+for like.
+
+```{r hold-prices}
+if (nrow(oos)) {
+  pr <- fread(params$prices_file, select = c("datadate", "LPERMNO", "prccd", "prcod", "ajexdi"))
+  if (is.numeric(pr$datadate)) pr[, datadate := as.IDate(as.character(datadate), "%Y%m%d")]
+  pr[, `:=`(datadate = as.IDate(datadate), LPERMNO = as.integer(LPERMNO))]
+  pr[, c("prccd", "prcod", "ajexdi") := lapply(.SD, as.numeric), .SDcols = c("prccd", "prcod", "ajexdi")]
+  pr <- unique(pr[!is.na(LPERMNO) & !is.na(datadate) & !is.na(prccd) & prccd > 0], by = c("LPERMNO", "datadate"))
+  cal <- data.table(datadate = sort(unique(pr$datadate)))[, idx := .I]
+  pr[cal, on = "datadate", idx := i.idx]
+  setorder(pr, LPERMNO, idx)
+  adj <- function(p, f) fifelse(!is.na(f) & f > 0 & !is.na(p) & p > 0, p / f, NA_real_)
+  pr[, `:=`(c_adj = adj(prccd, ajexdi), o_adj = adj(prcod, ajexdi))]
+  pr[, `:=`(pc = shift(c_adj), pidx = shift(idx)), by = LPERMNO]
+  consec <- !is.na(pr$pidx) & pr$pidx == pr$idx - 1L
+  pr[, `:=`(r_cc = fifelse(consec & !is.na(pc), c_adj / pc - 1, NA_real_), # close to close
+            r_co = fifelse(consec & !is.na(pc) & !is.na(o_adj), o_adj / pc - 1, NA_real_), # overnight
+            r_oc = fifelse(!is.na(prcod) & prcod > 0, prccd / prcod - 1, NA_real_))] # open to close
+  w <- function(x) { if (!any(!is.na(x))) return(x); q <- quantile(x, c(.001, .999), na.rm = TRUE, names = FALSE); pmin(pmax(x, q[1]), q[2]) }
+  pr[, `:=`(r_cc = w(r_cc), r_co = w(r_co), r_oc = w(r_oc)), by = idx]
+  pr <- pr[, .(LPERMNO, idx, r_cc, r_co, r_oc)]
+  setkey(pr, LPERMNO, idx)
+  rm(consec); invisible(gc())
+}
+```
+
+```{r cumulative-data}
+if (nrow(oos)) {
+  MAXH <- as.integer(params$max_hold_days)
+  MODE <- if (is.null(params$trade_mode)) "hold" else params$trade_mode
+  if (!MODE %in% c("hold", "intraday")) stop('trade_mode must be "hold" or "intraday".')
+  to_idx <- function(d) cal[data.table(datadate = as.IDate(d)), on = "datadate", roll = TRUE, x.idx]
+  first_idx <- to_idx(min(oos$datadate)) + 1L
+  last_idx  <- to_idx(max(oos$t1_date, na.rm = TRUE))
+
+  # Daily returns of a book that switches into each new selection and holds it until the next one
+  book <- function(sel) {
+    sel <- unique(sel[, .(LPERMNO = permno, sidx = to_idx(datadate), signal_date = datadate)],
+                  by = c("LPERMNO", "sidx"))[!is.na(sidx) & !is.na(LPERMNO)]
+    seg <- unique(sel[, .(sidx)])[order(sidx)]
+    seg[, `:=`(k = .I, e = sidx + 1L)]
+    seg[, nxt := shift(e, -1L, fill = last_idx + 1L)]
+    seg[, end := if (MAXH > 0) pmin(nxt - 1L, e + MAXH - 1L) else nxt - 1L]
+    seg <- seg[e <= last_idx]
+    hold <- sel[seg, on = "sidx", nomatch = NULL][, .(LPERMNO, k, e, end, signal_date)]
+
+    # ---- Intraday mode: buy at the open, sell at the close, every day the selection is active ----
+    if (MODE == "intraday") {
+      n  <- hold$end - hold$e + 1L
+      rt <- hold[rep(seq_len(.N), n)]
+      rt[, idx := e + sequence(n) - 1L]
+      rt[pr, on = .(LPERMNO, idx), r := i.r_oc]
+      rt <- rt[!is.na(r)]                                   # needs an opening auction price that day
+      out <- data.table(idx = first_idx:last_idx)
+      out[rt[, .(r = mean(r), n_held = .N), by = idx], on = "idx", `:=`(r = i.r, n_held = i.n_held)]
+      out[is.na(r), `:=`(r = 0, n_held = 0L)]
+      rt[cal, on = "idx", day := i.datadate]
+      pos <- rt[, .(LPERMNO, signal_date, entry_date = day, entry_at = "open", exit_date = day, exit_at = "close",
+                    trading_days_entry_to_exit = 0L, position_return = r)]
+      return(list(daily = out, positions = pos))
+    }
+
+    # entry day: new positions earn open-to-close (0 if the open is missing: bought at the close)
+    g_new <- hold[, .(LPERMNO, k, idx = e)]
+    g_new[pr, on = .(LPERMNO, idx), `:=`(r_oc = i.r_oc, r_cc = i.r_cc)]
+    open_ok <- g_new[, .(open_ok = mean(!is.na(r_oc)) >= 0.5), by = k]          # switch at the open if most opens exist
+    g_new <- g_new[open_ok, on = "k"][, .(g_new = mean(1 + fifelse(open_ok, fcoalesce(r_oc, 0), 0))), by = .(k, idx)]
+
+    # exit of the previous selection on the same day (only if it was still held the day before)
+    prev <- hold[, .(LPERMNO, k = k + 1L, prev_end = end)]
+    g_old <- prev[seg[, .(k, idx = e)], on = "k", nomatch = NULL][prev_end == idx - 1L]
+    g_old[pr, on = .(LPERMNO, idx), `:=`(r_co = i.r_co, r_cc = i.r_cc)]
+    g_old <- g_old[open_ok, on = "k"][, .(g_old = mean(1 + fifelse(open_ok, fcoalesce(r_co, 0), fcoalesce(r_cc, 0)))), by = .(k, idx)]
+
+    # days after entry: close to close
+    hm <- hold[end > e]
+    nn <- hm$end - hm$e
+    mid <- hm[rep(seq_len(.N), nn)]
+    mid[, idx := e + sequence(nn)]
+    mid[pr, on = .(LPERMNO, idx), r := i.r_cc]
+    mid_pos <- mid[, .(f_mid = prod(1 + fcoalesce(r, 0))), by = .(LPERMNO, k)]
+    mid <- mid[, .(r_mid = mean(fcoalesce(r, 0)), n_held = .N), by = idx]
+
+    out <- data.table(idx = first_idx:last_idx)
+    out[mid, on = "idx", `:=`(r = i.r_mid, n_held = i.n_held)]
+    sw <- merge(g_new, g_old, by = c("k", "idx"), all.x = TRUE)
+    sw[, r_sw := fcoalesce(g_old, 1) * g_new - 1]
+    sw[hold[, .N, by = k], on = "k", n_new := i.N]
+    out[sw, on = "idx", `:=`(r = i.r_sw, n_held = i.n_new)]
+    out[is.na(r), `:=`(r = 0, n_held = 0L)]
+
+    # One row per position: when it was bought and sold, and its return over the holding
+    pos <- hold[seg[, .(k, sidx, nxt)], on = "k", nomatch = NULL]
+    pos[sel, on = .(LPERMNO, sidx), signal_date := i.signal_date]
+    pos[open_ok, on = "k", entry_open := i.open_ok]
+    pos[copy(open_ok)[, k := k - 1L], on = "k", exit_open := i.open_ok]     # how the NEXT selection switched in
+    pos[, switched := end == nxt - 1L & nxt <= last_idx]                     # sold when the next selection arrived
+    pos[, exit_idx := fifelse(switched, nxt, end)]
+    pos[, exit_at := fifelse(switched, fifelse(exit_open, "open", "close"),
+                     fifelse(end >= last_idx, "still held at end of sample", "close (max_hold_days reached)"))]
+    pos[pr, on = .(LPERMNO, e = idx), r_entry := i.r_oc]
+    pos[pr, on = .(LPERMNO, exit_idx = idx), `:=`(r_x_co = i.r_co, r_x_cc = i.r_cc)]
+    pos[mid_pos, on = .(LPERMNO, k), f_mid := i.f_mid]
+    pos[, position_return := fifelse(entry_open, 1 + fcoalesce(r_entry, 0), 1) * fcoalesce(f_mid, 1) *
+                             fifelse(switched, 1 + fifelse(exit_open, fcoalesce(r_x_co, 0), fcoalesce(r_x_cc, 0)), 1) - 1]
+    pos[cal, on = .(e = idx), entry_date := i.datadate]
+    pos[cal, on = .(exit_idx = idx), exit_date := i.datadate]
+    pos[, `:=`(entry_at = fifelse(entry_open, "open", "close"), trading_days_entry_to_exit = exit_idx - e)]
+    pos <- pos[, .(LPERMNO, signal_date, entry_date, entry_at, exit_date, exit_at, trading_days_entry_to_exit, position_return)]
+
+    list(daily = out, positions = pos)
+  }
+
+  books <- list(all_buys = oos, model_top = oos[grp == "top"], model_bottom = oos[grp == "bottom"])
+  days <- data.table(idx = first_idx:last_idx)
+  positions <- list()
+  for (nm in names(books)) {
+    b <- book(books[[nm]])
+    days[b$daily, on = "idx", c(nm, paste0("n_", nm)) := .(i.r, i.n_held)]
+    positions[[nm]] <- b$positions
+  }
+
+  # Positions of the "All insider buys" book, with CIK and ticker
+  ids <- unique(ev[, .(LPERMNO = permno, signal_date = as.IDate(datadate), cik, tic)], by = c("LPERMNO", "signal_date"))
+  pos_all <- ids[positions$all_buys[, signal_date := as.IDate(signal_date)], on = .(LPERMNO, signal_date)]
+  setnames(pos_all, "LPERMNO", "permno")
+  setcolorder(pos_all, c("cik", "tic", "permno", "signal_date", "entry_date", "entry_at", "exit_date", "exit_at",
+                         "trading_days_entry_to_exit", "position_return"))
+  setorder(pos_all, entry_date, cik)
+  fwrite(pos_all, "all_insider_buys_positions.csv")
+
+  # Benchmark: universe stocks on day t-1, equal-weighted close-to-close on day t
+  ub <- unique(univ[, .(LPERMNO = as.integer(LPERMNO), idx = to_idx(datadate) + 1L)])
+  ub[pr, on = .(LPERMNO, idx), r := if (MODE == "intraday") i.r_oc else i.r_cc]
+  days[ub[!is.na(r), .(b = mean(r)), by = idx], on = "idx", bench := i.b]
+  days[is.na(bench), bench := 0]
+  days[cal, on = "idx", date := i.datadate]
+
+  series <- setNames(c("all_buys", "model_top", "model_bottom", "bench"),
+                     c("All insider buys", sprintf("Model top %g%%", TOP), sprintf("Model bottom %g%%", BOT),
+                       "Benchmark (universe EW)"))
+  max_dd <- function(r) { v <- cumprod(1 + r); min(v / cummax(v) - 1) }
+  perf <- rbindlist(lapply(names(series), function(nm) {
+    v <- series[[nm]]; r <- days[[v]]
+    held <- if (v == "bench") rep(TRUE, length(r)) else days[[paste0("n_", v)]] > 0
+    data.table(Portfolio = nm, `% days invested` = round(100 * mean(held), 1),
+               `Avg stocks held` = if (v == "bench") NA_real_ else round(mean(days[[paste0("n_", v)]][held]), 1),
+               `Mean (bp/day)` = round(1e4 * mean(r), 2),
+               `Ann. return %` = round(100 * (prod(1 + r)^(252 / length(r)) - 1), 1),
+               `Ann. Sharpe` = round(sqrt(252) * mean(r) / sd(r), 2),
+               `Max drawdown %` = round(100 * max_dd(r), 1),
+               `Total return %` = round(100 * (prod(1 + r) - 1), 1))
+  }))
+  show(perf, caption = sprintf("Out of sample, %s to %s, %s%s", min(days$date), max(days$date),
+                               if (MODE == "intraday") "bought at the open and sold at the close every day (benchmark open-to-close)"
+                               else "positions held until replaced (benchmark close-to-close)",
+                               if (MAXH > 0) sprintf(", positions held at most %d days without a new signal", MAXH) else ""))
+} else say("No out-of-sample predictions (see section 4), so there is nothing to plot.")
+```
+
+```{r cumulative-plot, fig.width = 9, fig.height = 4.5}
+if (nrow(oos)) {
+  cum <- days[, c(list(date = date), lapply(.SD, function(r) cumprod(1 + r))), .SDcols = unname(series)]
+  setnames(cum, unname(series), names(series))
+  cum <- melt(cum, id.vars = "date", variable.name = "Portfolio", value.name = "Growth of $1")
+  ggplot(cum, aes(date, `Growth of $1`, color = Portfolio)) +
+    geom_line(linewidth = 0.7) +
+    scale_y_log10() +
+    scale_color_manual(values = setNames(c("orange", "darkgreen", "firebrick", "gray50"), names(series))) +
+    labs(title = sprintf("Walk-forward (out-of-sample) cumulative returns, %s (log scale)",
+                         if (MODE == "intraday") "open-to-close every day" else "positions held until replaced"),
+         x = NULL, color = NULL) +
+    theme_minimal() + theme(legend.position = "top")
+}
+```
+
+```{r save}
+keep <- c("datadate", "permno", "cik", "tic", "ret", "bench", "excess", "up", "gfd_eom", FEATS)
+saveRDS(ev[, intersect(keep, names(ev)), with = FALSE], "insider_buy_events_fundamentals.rds")
+say("Events with all features saved to insider_buy_events_fundamentals.rds.")
+if (exists("pos_all")) {
+  say(sprintf("Positions of the 'All insider buys' portfolio saved to all_insider_buys_positions.csv: %s %s, %s companies, entries %s to %s.",
+              format(nrow(pos_all), big.mark = ","), if (MODE == "intraday") "open-to-close round trips" else "positions",
+              format(uniqueN(pos_all$cik), big.mark = ","),
+              min(pos_all$entry_date), max(pos_all$entry_date)))
+  show(head(pos_all, 10), caption = "First 10 positions")
+}
+```

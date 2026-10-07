@@ -1,0 +1,251 @@
+---
+title: "Daily Insider Transaction Features and Next-Day Returns"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output: html_document
+params:
+  insider_file: "insider_all.rds"                            # 
+  prices_file: "F:/CRSP/daily_prices_20000101_20250504.csv"  # CRSP daily returns data set
+  start_date: "2006-01-01"                                   #
+  end_date: "2025-04-30"                                     # 
+  output_file: "insider_daily_dataset.rds"                   # Form 4 Insider Trading data set                
+  exchanges: [11, 12, 14]      # exchange codes for U.S. Equity Exchanges (NYSE, Nasdaq, Amex)
+  winsor_lo: 0.01              # clip low returns at 1%tile each day
+  winsor_hi: 0.99              # clip high returns at 99%tile each day
+  drop_missing_returns: false  # false keeps days without a next-day open-to-close return (needed by  04_insider_holding_portfolios.Rmd, which computes its own returns)
+---
+
+<!--
+One row per company (cik) per trading day t, NYSE / NYSE American / Nasdaq only, from start_date to end_date:
+  * insider features from filings made on day t
+  * the return from the OPEN to the CLOSE of the next trading day, t+1:  prccd(t+1) / prcod(t+1) - 1
+
+Timing: a filing dated t is public by the end of day t (EDGAR accepts Forms 3/4/5 until 10pm ET with
+that day's date), so it is known before the open of t+1. A filing dated on an exchange holiday that
+EDGAR is open for (e.g. Good Friday) is assigned to the last trading day before it; it is still known
+before the next open.
+
+Open-to-close returns need no split/dividend adjustment: the open and close are from the same day.
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(data.table)
+say  <- function(...) cat(paste0(...), "\n\n", sep = "")
+show <- function(x, caption = NULL, ...) {          # plain console-style table
+  if (!is.null(caption)) cat(caption, "\n", sep = "")
+  print(as.data.table(x), nrows = 1e5, row.names = FALSE)
+  cat("\n")
+}
+START <- as.IDate(params$start_date)
+END   <- as.IDate(params$end_date)
+EXCH  <- as.integer(unlist(params$exchanges))   # Compustat exchg: 11 NYSE, 12 NYSE American, 14 Nasdaq
+winsor <- function(x, lo, hi) { q <- quantile(x, c(lo, hi), na.rm = TRUE, names = FALSE); pmin(pmax(x, q[1]), q[2]) }
+```
+
+## 1. Prices and next-day returns
+
+```{r prices}
+prices <- fread(params$prices_file, select = c("datadate", "exchg", "LPERMNO", "tic", "cik", "prccd", "prcod", "cshoc"))
+if (is.numeric(prices$datadate)) prices[, datadate := as.IDate(as.character(datadate), "%Y%m%d")]
+prices[, `:=`(datadate = as.IDate(datadate), cik = as.integer(cik))]
+# Share counts above ~2.1 billion are read as 64-bit integers (integer64), which break arithmetic like
+# weighted means downstream. Store prices and shares as plain doubles.
+prices[, c("prccd", "prcod", "cshoc") := lapply(.SD, as.numeric), .SDcols = c("prccd", "prcod", "cshoc")]
+prices <- prices[!is.na(datadate) & !is.na(cik) & exchg %in% EXCH]   # NYSE, NYSE American, Nasdaq only
+
+# Security id: LPERMNO where available, else cik + ticker
+prices[, sec := fifelse(is.na(LPERMNO), paste0("c", cik, "_", tic), as.character(LPERMNO))]
+prices <- unique(prices, by = c("sec", "datadate"))
+
+# Market calendar: every date that has any price. The next trading day comes from it, so a security
+# with a gap in its data does not get a "next day" return that is really weeks later.
+cal <- data.table(datadate = sort(unique(prices$datadate)))
+cal[, `:=`(next_date = shift(datadate, -1L), prev_date = shift(datadate))]
+
+setorder(prices, sec, datadate)
+
+# Missing (or zero) opens: use the same security's open from the previous trading day.
+# Flagged, because the target then starts at day t's open, before the day-t filing was public.
+prices[, prcod := as.numeric(prcod)]
+prices[, `:=`(p_date = shift(datadate), p_open = shift(prcod)), by = sec]
+prices[cal, on = "datadate", prev_trading := i.prev_date]
+prices[, open_filled := as.integer((is.na(prcod) | prcod <= 0) & !is.na(p_open) & p_open > 0 &
+                                   !is.na(p_date) & p_date == prev_trading)]
+prices[open_filled == 1L, prcod := p_open]
+prices[, c("p_date", "p_open", "prev_trading") := NULL]
+
+prices[, `:=`(t1_date = shift(datadate, -1L), t1_open = shift(prcod, -1L), t1_close = shift(prccd, -1L),
+              t1_open_filled = shift(open_filled, -1L)), by = sec]
+prices[cal, on = "datadate", next_date := i.next_date]
+prices[, ret_t1_oc := fifelse(!is.na(t1_date) & t1_date == next_date & t1_open > 0 & t1_close > 0,
+                              t1_close / t1_open - 1, NA_real_)]
+
+# One row per company per day: the security with the largest market cap that day.
+# Company market cap = sum over its listed share classes, from day-t close and day-t shares outstanding.
+prices[, mktcap := prccd * cshoc]
+prices[, company_mcap := sum(mktcap, na.rm = TRUE), by = .(cik, datadate)]
+prices[company_mcap <= 0, company_mcap := NA_real_]
+setorderv(prices, c("cik", "datadate", "mktcap"), c(1L, 1L, -1L), na.last = TRUE)
+panel <- unique(prices, by = c("cik", "datadate"))[datadate >= START & datadate <= END,
+          .(datadate, cik, LPERMNO, tic, exchg, prccd, mktcap, company_mcap, t1_date, t1_open, t1_close,
+            t1_open_filled, ret_t1_oc)]
+
+# Market-cap rank each day, over ALL listed companies with a day-t market cap. Only day-t data is used, and
+# stocks are NOT required to have a t+1 return (that would drop stocks that later delist: look-ahead).
+panel[!is.na(company_mcap), mcap_rank := frank(-company_mcap, ties.method = "first"), by = datadate]
+rm(prices); invisible(gc())
+
+say(sprintf("Returns using a substituted open (previous day's open): %.2f%% of rows with a return.",
+            100 * panel[!is.na(ret_t1_oc), mean(t1_open_filled == 1L, na.rm = TRUE)]))
+say(sprintf("Panel: %s company-days, %s companies, %s to %s. Next-day open-to-close return available for %.1f%% of rows.",
+            format(nrow(panel), big.mark = ","), format(uniqueN(panel$cik), big.mark = ","),
+            min(panel$datadate), max(panel$datadate), 100 * mean(!is.na(panel$ret_t1_oc))))
+```
+
+## 2. Insider features for day t
+
+Definitions (per company and day):
+
+* **Buys and sells** are open-market purchases (`TRANS_CODE` P) and sales (S) of the stock itself
+  (`DERIVATIVE == 0`). Dollar value = shares x reported price per share.
+* **Amendments** (`4/A` etc.) are excluded, so corrected filings aren't counted twice.
+* **Insiders** are distinct reporting owners (`RPTOWNERCIK`).
+
+```{r features}
+insider <- readRDS(params$insider_file)
+setDT(insider)
+tr <- insider[!grepl("/A$", DOCUMENT_TYPE) & !is.na(ISSUERCIK) & !is.na(FILING_DATE) &
+              FILING_DATE >= min(cal$datadate) & FILING_DATE <= max(cal$datadate),
+              .(acc = ACCESSION_NUMBER, cik = ISSUERCIK, fdate = as.IDate(FILING_DATE), own = RPTOWNERCIK,
+                dir = fcoalesce(IS_DIRECTOR, 0L), off = fcoalesce(IS_OFFICER, 0L),
+                ten = fcoalesce(IS_TENPERCENTOWNER, 0L), oth = fcoalesce(IS_OTHER, 0L),
+                deriv = DERIVATIVE, code = TRANS_CODE, shares = TRANS_SHARES, price = TRANS_PRICEPERSHARE)]
+rm(insider); invisible(gc())
+
+# Day t = the filing date, or the last trading day before it if the market was closed
+tr[, datadate := cal[tr, on = .(datadate = fdate), roll = TRUE, x.datadate]]
+
+# Open-market trades, one row per insider per day
+ps <- tr[deriv == 0L & code %chin% c("P", "S") & !is.na(shares) & shares > 0]
+ps[, `:=`(buy_val = fifelse(code == "P", shares * price, 0), sell_val = fifelse(code == "S", shares * price, 0))]
+od <- ps[, .(buy_val = sum(buy_val, na.rm = TRUE), sell_val = sum(sell_val, na.rm = TRUE),
+             is_buyer = any(code == "P"), is_seller = any(code == "S"),
+             dir = max(dir), off = max(off), ten = max(ten), oth = max(oth)),
+         by = .(cik, datadate, own)]
+
+feat <- od[, .(ins_buy_dollar  = sum(buy_val),
+               ins_sell_dollar = sum(sell_val),
+               ins_n_insiders  = .N,
+               ins_n_buyers    = sum(is_buyer),
+               ins_n_sellers   = sum(is_seller),
+               ins_n_director  = sum(dir),
+               ins_n_officer   = sum(off),
+               ins_n_tenpct    = sum(ten),
+               ins_n_other     = sum(oth)),
+           by = .(cik, datadate)]
+feat <- merge(unique(tr[, .(cik, datadate, acc)])[, .(ins_n_filings = .N), by = .(cik, datadate)],
+              feat, by = c("cik", "datadate"), all.x = TRUE)
+
+# Attach to the panel; days without filings get zeros
+dt <- merge(panel, feat, by = c("cik", "datadate"), all.x = TRUE)
+fcols <- setdiff(names(feat), c("cik", "datadate"))
+for (v in fcols) set(dt, which(is.na(dt[[v]])), v, 0)
+dt[, `:=`(ins_net_dollar  = ins_buy_dollar - ins_sell_dollar,
+          ins_buy_gt_sell = as.integer(ins_buy_dollar > ins_sell_dollar),
+          ins_sell_gt_buy = as.integer(ins_sell_dollar > ins_buy_dollar))]
+dt[, ins_net_dollar_mcap := fifelse(mktcap > 0, ins_net_dollar / mktcap, NA_real_)]
+setcolorder(dt, c("datadate", "cik", "LPERMNO", "tic", "ret_t1_oc", "ins_net_dollar", "ins_buy_gt_sell",
+                  "ins_sell_gt_buy", "ins_n_insiders", "ins_n_director", "ins_n_officer", "ins_n_tenpct",
+                  "ins_n_other"))
+setorder(dt, datadate, cik)
+
+
+matched <- feat[, mean(paste(cik, datadate) %chin% dt[, paste(cik, datadate)])]
+say(sprintf("Company-days with insider filings: %s, of which %.1f%% match a company-day in the price panel.",
+            format(nrow(feat), big.mark = ","), 100 * matched))
+```
+
+## 3. Clean
+
+Rows are dropped if the market cap is missing, and (if `drop_missing_returns` is true) if the next-day
+return is missing. `mcap_rank` was computed earlier,
+over all listed companies before any row was dropped. That matters: ranking only the stocks that turned
+out to have a next-day return would use future information. The winsorizing is done after the cleaning,
+so its cutoffs reflect the final dataset.
+
+```{r clean}
+n0 <- nrow(dt)
+na_ret  <- is.na(dt$ret_t1_oc)
+na_mcap <- is.na(dt$company_mcap)
+drop_ret <- isTRUE(params$drop_missing_returns)
+keep <- !na_mcap & (!drop_ret | !na_ret)
+show(data.table(Step = c("Before cleaning", sprintf("Missing next-day return (%s)", if (drop_ret) "dropped" else "kept"),
+                         "Missing market cap (dropped)", "After cleaning"),
+                Rows = c(n0, sum(na_ret), sum(na_mcap), sum(keep))))
+dt <- dt[keep]
+rm(na_ret, na_mcap, keep)
+
+# Winsorized target: clipped at the winsor_lo / winsor_hi percentiles within each day, across all companies
+dt[, ret_t1_oc_w := if (any(!is.na(ret_t1_oc))) winsor(ret_t1_oc, params$winsor_lo, params$winsor_hi) else NA_real_,
+   by = datadate]
+setcolorder(dt, c("datadate", "cik", "LPERMNO", "tic", "ret_t1_oc", "ret_t1_oc_w", "mcap_rank", "company_mcap"))
+```
+
+## 4. Checks
+
+```{r checks}
+yr <- dt[, .(`Company-days` = .N,
+             `With a filing` = sum(ins_n_filings > 0),
+             `Buy $ > sell $` = sum(ins_buy_gt_sell),
+             `Sell $ > buy $` = sum(ins_sell_gt_buy)),
+         by = .(Year = as.character(year(datadate)))][order(Year)]
+show(yr)
+
+say(sprintf("Exchanges: %s only. Rows: %s. Companies per day: median %s. Missing values in any column: %s.",
+            paste(EXCH, collapse = "/"), format(nrow(dt), big.mark = ","), median(dt[, .N, by = datadate]$N),
+            { m <- sapply(dt, function(x) sum(is.na(x))); if (any(m > 0)) paste(sprintf("%s %s", names(m)[m > 0], m[m > 0]), collapse = ", ") else "none" }))
+
+say("Next-day open-to-close return by signal (basis points):")
+dt[, Signal := fifelse(ins_buy_gt_sell == 1L, "Buy $ > sell $",
+               fifelse(ins_sell_gt_buy == 1L, "Sell $ > buy $", "Neither / no trades"))]
+show(dt[!is.na(ret_t1_oc), .(`Days (all)` = .N,
+                             `Mean raw, all` = round(1e4 * mean(ret_t1_oc), 2),
+                             `Mean winsorized` = round(1e4 * mean(ret_t1_oc_w), 2),
+                             `Median` = round(1e4 * median(ret_t1_oc), 2)),
+        by = Signal][order(Signal)])
+dt[, Signal := NULL]
+
+say("The 15 most extreme raw returns (what was distorting the mean):")
+show(head(dt[!is.na(ret_t1_oc)][order(-abs(ret_t1_oc)),
+             .(datadate, cik, tic, exchg, mcap_rank, close_t = prccd, t1_date, t1_open, t1_close,
+               `return %` = round(100 * ret_t1_oc, 1))], 15))
+```
+
+```{r save}
+saveRDS(dt, params$output_file)
+say(sprintf("Saved %s rows x %d columns to %s.", format(nrow(dt), big.mark = ","), ncol(dt),
+            normalizePath(params$output_file)))
+```
+
+### Columns
+
+| Column | Definition |
+|---|---|
+| `datadate` | Day t |
+| `cik`, `LPERMNO`, `tic` | Company, and the security used for prices (largest market cap that day) |
+| `company_mcap` | Company market cap on day t: day-t close x day-t shares outstanding, summed over its listed share classes |
+| `mcap_rank` | Rank of `company_mcap` among all listed companies that day (1 = largest). Uses day-t data only, so `mcap_rank <= 500` is a leak-free top-500 filter |
+| `ret_t1_oc` | Raw open to close return on the next trading day: `t1_close / t1_open - 1`. NA if the next trading day's open or close is missing |
+| `ret_t1_oc_w` | `ret_t1_oc` winsorized at the 1st/99th percentile within each day, across all companies |
+| `exchg` | Compustat exchange code |
+| `t1_date`, `t1_open`, `t1_close` | The next trading day and its open and close |
+| `t1_open_filled` | 1 if the t+1 open was missing and the previous trading day's open (day t) was used instead. Those returns start before the day-t filing was public, so consider excluding them |
+| `prccd`, `mktcap` | Close and market cap on day t of the security used for prices |
+| `ins_buy_dollar`, `ins_sell_dollar` | $ of open-market purchases / sales filed on day t |
+| `ins_net_dollar` | Buy $ minus sell $ |
+| `ins_buy_gt_sell`, `ins_sell_gt_buy` | 1 if buy $ > sell $ (resp. sell $ > buy $) |
+| `ins_net_dollar_mcap` | `ins_net_dollar` / market cap |
+| `ins_n_insiders` | Distinct insiders with an open-market trade filed on day t |
+| `ins_n_buyers`, `ins_n_sellers` | Of those, how many bought / sold |
+| `ins_n_director`, `ins_n_officer`, `ins_n_tenpct`, `ins_n_other` | Of those, how many are directors / officers / 10% owners / other (a person can count in several) |
+| `ins_n_filings` | Filings of any kind (grants, exercises, etc. included) filed on day t |

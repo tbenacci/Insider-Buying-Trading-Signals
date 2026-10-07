@@ -1,0 +1,943 @@
+---
+title: "SEC Insider Filings (Forms 3, 4, 5) Collection Pipeline"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    toc: true
+params:
+  user_agent: "Thomas Benacci tabenacci@gmail.com"       # user credentials for accessing SEC data
+  data_dir: "insider_data"                               # folder for storing SEC-reported insider data
+  start_date: "2006-01-01"                               # earliest recorded date in quarterly-compiled files
+  form_types: ["3", "3/A", "4", "4/A", "5", "5/A"]       # form types (3: Initial Statement of Beneficial Ownership, 4: Changes in Beneficial Ownership, 5: Annual Statement of Changes in Beneficial Ownership, where "A" stand for Ammendment documents)
+  include_today: true                                    # collect forms on today's system date
+  requests_per_second: 8                                 # under 10 to prevent rate limit error
+  max_parse_attempts: 3                                  # maximum number of attempts to request a filing before moving on
+  chunk_size: 2000                                       # batch size of filings to collect before saving them
+  keep_zips: false                                       # 
+  sec_base: "https://www.sec.gov"                        #
+  as_of: ""                                              # 
+---
+
+<!--
+HOW TO RUN
+  1. Set user_agent above to your name and email (the SEC requires it).
+  2. Knit in RStudio, or from a terminal / scheduler:
+       Rscript -e 'rmarkdown::render("01_insider_pipeline.Rmd")'
+  3. Run it as often as you like. Every run brings the data fully up to date and
+     only does the work that is still missing.
+
+REQUIRED PACKAGES: data.table, curl, xml2, R.utils, rmarkdown
+
+WHAT IT DOES
+  Step 1  Downloads the SEC's quarterly Insider Transactions Data Sets (bulk,
+          fast) and re-ingests any quarter the SEC has re-published.
+  Step 2  Downloads EDGAR's own filing index (the authoritative list of every
+          filing) for every quarter, plus the daily indexes for the last
+          10 days and, when run on the current day, today's live filings.
+  Step 3  Compares the two by accession number and downloads and parses only
+          the filings that are not already stored, directly from EDGAR.
+  Step 4  Writes a completeness report that accounts for every filing in
+          EDGAR's index: stored, or listed with the reason it could not be.
+
+OUTPUT (in data_dir/tables/, one folder per table, one .csv.gz per quarter)
+  The eight tables and their columns follow the SEC's documentation exactly:
+  https://www.sec.gov/files/insider_transactions_readme.pdf
+  Files named sec_YYYYqN come from the SEC's quarterly data sets, and files named
+  xml_YYYYqN were parsed from the original filings. When the SEC later publishes
+  a quarter, its version replaces the parsed one automatically. Use
+  read_insider.R to load the tables.
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = TRUE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(curl)
+  library(xml2)
+})
+if (!requireNamespace("R.utils", quietly = TRUE))
+  stop("Package 'R.utils' is required to read .csv.gz files: install.packages('R.utils')")
+invisible(Sys.setlocale("LC_TIME", "C"))   # SEC dates use English month abbreviations
+`%||%` <- function(a, b) if (is.null(a) || !length(a)) b else a
+say <- function(...) cat(paste0(...), "\n", sep = "")
+show <- function(x, caption = NULL, ...) {          # plain console-style table
+  if (!is.null(caption)) cat(caption, "\n", sep = "")
+  print(as.data.table(x), nrows = 1e5, row.names = FALSE)
+  cat("\n")
+}
+fmt_min <- function(t0) { m <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  if (m < 1) sprintf("%.0f sec", m * 60) else if (m < 120) sprintf("%.1f min", m) else sprintf("%.1f hours", m / 60) }
+```
+
+```{r config}
+P     <- params
+UA    <- P$user_agent
+BASE  <- sub("/+$", "", P$sec_base)
+DATA  <- P$data_dir
+START <- as.Date(P$start_date)
+FORMS <- as.character(unlist(P$form_types))
+RATE  <- as.numeric(P$requests_per_second)
+MAXPF <- as.integer(P$max_parse_attempts)
+CHUNK <- as.integer(P$chunk_size)
+AS_OF <- if (is.null(P$as_of) || !nzchar(P$as_of)) Sys.Date() else as.Date(P$as_of)
+LIVE  <- isTRUE(P$include_today) && AS_OF == Sys.Date()
+
+stopifnot(!is.na(START), !is.na(AS_OF), START <= AS_OF, RATE > 0, RATE <= 10,
+          MAXPF >= 1, CHUNK >= 1, all(FORMS %in% c("3", "3/A", "4", "4/A", "5", "5/A")))
+if (BASE == "https://www.sec.gov" && grepl("example\\.com|Your Name", UA))
+  stop("Set the user_agent parameter to your name and email address. ",
+       "The SEC blocks automated requests that don't identify the requester.")
+
+D <- list(tables   = file.path(DATA, "tables"),
+          state    = file.path(DATA, "state"),
+          registry = file.path(DATA, "state", "registry"),
+          index    = file.path(DATA, "state", "index"),
+          zips     = file.path(DATA, "state", "zips"))
+invisible(lapply(D, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+LOG_FILE <- file.path(D$state, "run_log.txt")
+log_msg <- function(...) {
+  line <- sprintf("[%s] %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), paste0(...))
+  cat(line, "\n", sep = "", file = stderr())
+  cat(line, "\n", sep = "", file = LOG_FILE, append = TRUE)
+}
+
+# One run at a time: a second concurrent run could corrupt the files.
+LOCK <- file.path(D$state, "run.lock")
+if (file.exists(LOCK)) {
+  info  <- readLines(LOCK, warn = FALSE)
+  pid   <- suppressWarnings(as.integer(info[1]))
+  age_h <- as.numeric(difftime(Sys.time(), file.mtime(LOCK), units = "hours"))
+  alive <- if (.Platform$OS.type == "unix" && !is.na(pid)) isTRUE(tools::pskill(pid, 0L)) else age_h < 24
+  if (alive && age_h < 48)
+    stop("Another run appears to be in progress (", LOCK, "). If it is not, delete that file and run again.")
+}
+writeLines(c(as.character(Sys.getpid()), format(Sys.time())), LOCK)
+.lock_guard <- new.env()
+invisible(reg.finalizer(.lock_guard, function(e) unlink(LOCK), onexit = TRUE))
+
+RUN_START <- Sys.time()
+log_msg("==== Run started | as of ", AS_OF, " | start ", START, " | forms ", paste(FORMS, collapse = ","))
+```
+
+```{r http}
+# ---- HTTP: rate-limited to RATE requests per second across everything ----
+HTTP <- new.env()
+HTTP$next_ok <- 0
+
+throttle <- function(k = 1) {
+  now <- as.numeric(Sys.time())
+  if (HTTP$next_ok > now) Sys.sleep(HTTP$next_ok - now)
+  HTTP$next_ok <- max(as.numeric(Sys.time()), HTTP$next_ok) + 1.05 * k / RATE   # 5% safety margin
+}
+pause_for <- function(sec) HTTP$next_ok <- max(HTTP$next_ok, as.numeric(Sys.time()) + sec)
+handle <- function(...) new_handle(useragent = UA, connecttimeout = 30, ...)
+
+# Single request into memory. Returns list(status, raw, headers). Status 0 = network error.
+sec_fetch <- function(url, tries = 5, nobody = FALSE) {
+  st <- 0L
+  for (i in seq_len(tries)) {
+    throttle(1)
+    res <- tryCatch(curl_fetch_memory(url, handle = handle(timeout = 120, nobody = nobody)),
+                    error = function(e) NULL)
+    st <- if (is.null(res)) 0L else as.integer(res$status_code)
+    if (st == 403L && !is_rate_limit(res$content)) st <- 404L
+    if (st %in% c(200L, 404L))
+      return(list(status = st, raw = if (st == 200L) res$content else NULL, headers = res$headers))
+    if (i < tries) {
+      wait <- if (st %in% c(403L, 429L)) 60 * i else 2^i
+      log_msg("HTTP ", st, " for ", url, "; retrying in ", wait, "s")
+      pause_for(wait)
+    }
+  }
+  list(status = st, raw = NULL, headers = NULL)
+}
+
+# Single request straight to disk (large files). Returns the HTTP status.
+sec_fetch_disk <- function(url, dest, tries = 4) {
+  tmp <- paste0(dest, ".part")
+  st <- 0L
+  for (i in seq_len(tries)) {
+    throttle(1)
+    res <- tryCatch(curl_fetch_disk(url, tmp, handle = handle(timeout = 3600)), error = function(e) NULL)
+    st <- if (is.null(res)) 0L else as.integer(res$status_code)
+    if (st == 200L) { replace_file(tmp, dest); return(st) }
+    if (st == 403L && file.exists(tmp) && !is_rate_limit(readBin(tmp, "raw", 20000))) st <- 404L
+    unlink(tmp)
+    if (st == 404L) return(st)
+    if (i < tries) {
+      wait <- if (st %in% c(403L, 429L)) 60 * i else 2^i
+      log_msg("HTTP ", st, " for ", url, "; retrying in ", wait, "s")
+      pause_for(wait)
+    }
+  }
+  st
+}
+
+# Many small requests, RATE at a time in parallel, never more than RATE per second.
+fetch_many <- function(urls) {
+  n <- length(urls)
+  out <- vector("list", n)
+  if (!n) return(out)
+  for (b in split(seq_len(n), ceiling(seq_len(n) / RATE))) {
+    throttle(length(b))
+    pool <- new_pool(total_con = length(b), host_con = length(b))
+    for (k in b) local({
+      j <- k
+      curl_fetch_multi(
+        urls[j], pool = pool, handle = handle(timeout = 90),
+        done = function(res) {
+          st <- as.integer(res$status_code)
+          if (st == 403L && !is_rate_limit(res$content)) st <- 404L
+          out[[j]] <<- list(status = st, raw = if (st == 200L) res$content else NULL)
+        },
+        fail = function(msg) out[[j]] <<- list(status = 0L, raw = NULL))
+    })
+    multi_run(pool = pool)
+    st <- vapply(out[b], function(x) if (is.null(x)) 0L else x$status, integer(1))
+    if (any(st %in% c(403L, 429L))) {
+      log_msg("SEC rate limit response (HTTP ", st[st %in% c(403L, 429L)][1], "); pausing 60s")
+      pause_for(60)
+    }
+  }
+  lapply(out, function(x) x %||% list(status = 0L, raw = NULL))
+}
+
+replace_file <- function(tmp, dest) {
+  if (!file.rename(tmp, dest)) {
+    unlink(dest)
+    if (!file.rename(tmp, dest)) stop("Could not write ", dest)
+  }
+}
+raw_text <- function(raw) { raw[raw == as.raw(0)] <- as.raw(32); rawToChar(raw) }
+# EDGAR answers 403 both for real rate limiting and for files that don't exist (yet).
+# Only the rate-limit page mentions the request rate / automated tools; any other 403 means "not there".
+is_rate_limit <- function(raw) {
+  if (is.null(raw) || !length(raw)) return(FALSE)
+  grepl("rate threshold|request rate|automated tool", raw_text(raw[seq_len(min(length(raw), 20000))]),
+        ignore.case = TRUE)
+}
+```
+
+```{r schema}
+# ---- Schema: the SEC's eight tables, columns exactly as documented ----
+fn <- function(...) { x <- c(...); as.vector(rbind(x, paste0(x, "_FN"))) }
+
+SCHEMA <- list(
+  SUBMISSION = c("ACCESSION_NUMBER", "FILING_DATE", "PERIOD_OF_REPORT", "DATE_OF_ORIG_SUB",
+                 "NO_SECURITIES_OWNED", "NOT_SUBJECT_SEC16", "FORM3_HOLDING_REPORTED",
+                 "FORM4_TRANS_REPORTED", "DOCUMENT_TYPE", "ISSUERCIK", "ISSUERNAME",
+                 "ISSUERTRADINGSYMBOL", "REMARKS", "AFF10B5ONE", "SOURCE"),
+  REPORTINGOWNER = c("ACCESSION_NUMBER", "RPTOWNERCIK", "RPTOWNERNAME", "RPTOWNER_RELATIONSHIP",
+                     "RPTOWNER_TITLE", "RPTOWNER_TXT", "RPTOWNER_STREET1", "RPTOWNER_STREET2",
+                     "RPTOWNER_CITY", "RPTOWNER_STATE", "RPTOWNER_ZIPCODE", "RPTOWNER_STATE_DESC",
+                     "FILE_NUMBER", "IS_DIRECTOR", "IS_OFFICER", "IS_TENPERCENTOWNER", "IS_OTHER"),
+  NONDERIV_TRANS = c("ACCESSION_NUMBER", "NONDERIV_TRANS_SK", fn("SECURITY_TITLE", "TRANS_DATE",
+                     "DEEMED_EXECUTION_DATE"), "TRANS_FORM_TYPE", "TRANS_CODE", "EQUITY_SWAP_INVOLVED",
+                     "EQUITY_SWAP_TRANS_CD_FN", fn("TRANS_TIMELINESS", "TRANS_SHARES",
+                     "TRANS_PRICEPERSHARE", "TRANS_ACQUIRED_DISP_CD", "SHRS_OWND_FOLWNG_TRANS",
+                     "VALU_OWND_FOLWNG_TRANS", "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP")),
+  NONDERIV_HOLDING = c("ACCESSION_NUMBER", "NONDERIV_HOLDING_SK", fn("SECURITY_TITLE",
+                       "TRANS_FORM_TYPE", "SHRS_OWND_FOLWNG_TRANS", "VALU_OWND_FOLWNG_TRANS",
+                       "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP")),
+  DERIV_TRANS = c("ACCESSION_NUMBER", "DERIV_TRANS_SK", fn("SECURITY_TITLE", "CONV_EXERCISE_PRICE",
+                  "TRANS_DATE", "DEEMED_EXECUTION_DATE"), "TRANS_FORM_TYPE", "TRANS_CODE",
+                  "EQUITY_SWAP_INVOLVED", "EQUITY_SWAP_TRANS_CD_FN", fn("TRANS_TIMELINESS",
+                  "TRANS_SHARES", "TRANS_TOTAL_VALUE", "TRANS_PRICEPERSHARE", "TRANS_ACQUIRED_DISP_CD",
+                  "EXCERCISE_DATE", "EXPIRATION_DATE", "UNDLYNG_SEC_TITLE", "UNDLYNG_SEC_SHARES",
+                  "UNDLYNG_SEC_VALUE", "SHRS_OWND_FOLWNG_TRANS", "VALU_OWND_FOLWNG_TRANS",
+                  "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP")),
+  DERIV_HOLDING = c("ACCESSION_NUMBER", "DERIV_HOLDING_SK", fn("SECURITY_TITLE", "CONV_EXERCISE_PRICE",
+                    "TRANS_FORM_TYPE", "EXERCISE_DATE", "EXPIRATION_DATE", "UNDLYNG_SEC_TITLE",
+                    "UNDLYNG_SEC_SHARES", "UNDLYNG_SEC_VALUE", "SHRS_OWND_FOLWNG_TRANS",
+                    "VALU_OWND_FOLWNG_TRANS", "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP")),
+  FOOTNOTES = c("ACCESSION_NUMBER", "FOOTNOTE_ID", "FOOTNOTE_TXT"),
+  OWNER_SIGNATURE = c("ACCESSION_NUMBER", "OWNERSIGNATURENAME", "OWNERSIGNATUREDATE")
+)
+TABLES      <- names(SCHEMA)
+WRITE_ORDER <- c(setdiff(TABLES, "SUBMISSION"), "SUBMISSION")   # SUBMISSION last = batch complete
+ADDED_COLS  <- c("SOURCE", "IS_DIRECTOR", "IS_OFFICER", "IS_TENPERCENTOWNER", "IS_OTHER")
+REQUIRED    <- list(SUBMISSION = c("ACCESSION_NUMBER", "FILING_DATE", "DOCUMENT_TYPE", "ISSUERCIK"),
+                    REPORTINGOWNER = c("ACCESSION_NUMBER", "RPTOWNERCIK"),
+                    NONDERIV_TRANS = c("ACCESSION_NUMBER", "TRANS_CODE", "TRANS_SHARES", "TRANS_ACQUIRED_DISP_CD"))
+ACC_RE <- "^\\d{10}-\\d{2}-\\d{6}$"
+
+DATE_COLS <- c("FILING_DATE", "PERIOD_OF_REPORT", "DATE_OF_ORIG_SUB", "TRANS_DATE", "DEEMED_EXECUTION_DATE",
+               "EXCERCISE_DATE", "EXERCISE_DATE", "EXPIRATION_DATE", "OWNERSIGNATUREDATE")
+NUM_COLS  <- c("TRANS_SHARES", "TRANS_PRICEPERSHARE", "SHRS_OWND_FOLWNG_TRANS", "VALU_OWND_FOLWNG_TRANS",
+               "CONV_EXERCISE_PRICE", "TRANS_TOTAL_VALUE", "UNDLYNG_SEC_SHARES", "UNDLYNG_SEC_VALUE")
+BOOL_COLS <- c("NO_SECURITIES_OWNED", "NOT_SUBJECT_SEC16", "FORM3_HOLDING_REPORTED", "FORM4_TRANS_REPORTED",
+               "AFF10B5ONE", "EQUITY_SWAP_INVOLVED", "IS_DIRECTOR", "IS_OFFICER", "IS_TENPERCENTOWNER", "IS_OTHER")
+CIK_COLS  <- c("ISSUERCIK", "RPTOWNERCIK")
+
+# ---- Value standardization (identical output for both sources) ----
+to_iso <- function(x) {                     # ISO, DD-MON-YYYY or YYYYMMDD -> "YYYY-MM-DD"
+  x <- trimws(as.character(x))
+  u <- unique(x[!is.na(x) & nzchar(x)])
+  if (!length(u)) return(rep(NA_character_, length(x)))
+  d <- as.Date(substr(u, 1, 10), "%Y-%m-%d")
+  for (f in c("%d-%b-%Y", "%Y%m%d")) {
+    i <- is.na(d)
+    if (any(i)) d[i] <- as.Date(u[i], f)
+  }
+  as.character(d)[match(x, u)]
+}
+to_num  <- function(x) suppressWarnings(as.numeric(gsub("[,$[:space:]]", "", as.character(x))))
+to_bool <- function(x) {
+  y <- tolower(trimws(as.character(x)))
+  fifelse(y %in% c("1", "true", "y", "yes"), 1L, fifelse(y %in% c("0", "false", "n", "no"), 0L, NA_integer_))
+}
+to_cik  <- function(x) { x <- trimws(as.character(x)); sub("^0+(?=\\d)", "", x, perl = TRUE) }
+clean_text <- function(x) {
+  x <- as.character(x)
+  bad <- which(!is.na(x) & !validUTF8(x))
+  if (length(bad)) x[bad] <- iconv(x[bad], "latin1", "UTF-8", sub = "?")
+  ctl <- which(grepl("[\r\n\t]", x))
+  if (length(ctl)) x[ctl] <- gsub("[\r\n\t]+", " ", x[ctl])
+  x <- trimws(x)
+  x[!is.na(x) & !nzchar(x)] <- NA_character_
+  x
+}
+
+conform <- function(dt, tbl) {
+  cols <- SCHEMA[[tbl]]
+  dt <- if (is.null(dt) || !ncol(dt)) as.data.table(setNames(replicate(length(cols), character(), FALSE), cols))
+        else as.data.table(dt)
+  miss <- setdiff(cols, names(dt))
+  if (length(miss)) dt[, (miss) := NA_character_]
+  dt <- dt[, ..cols]
+  for (c in cols) {
+    v <- dt[[c]]
+    v <- if (c %in% DATE_COLS) to_iso(v) else if (c %in% NUM_COLS) to_num(v)
+         else if (c %in% BOOL_COLS) to_bool(v) else if (c %in% CIK_COLS) clean_text(to_cik(v))
+         else clean_text(v)
+    set(dt, j = c, value = v)
+  }
+  dt[]
+}
+
+# ---- Quarter helpers ----
+q_start <- function(d) as.Date(sprintf("%s-%02d-01", format(d, "%Y"), (as.integer(format(d, "%m")) - 1) %/% 3 * 3 + 1))
+q_end   <- function(d) { s <- q_start(d); as.Date(sapply(s, function(x) seq(x, by = "3 months", length.out = 2)[2]), origin = "1970-01-01") - 1 }
+qtag    <- function(d) paste0(format(d, "%Y"), "q", (as.integer(format(d, "%m")) - 1) %/% 3 + 1)
+tag_start <- function(tag) as.Date(sprintf("%s-%02d-01", substr(tag, 1, 4), (as.integer(substr(tag, 6, 6)) - 1) * 3 + 1))
+```
+
+```{r storage}
+# ---- Storage: tables/<table>/<batch>.csv.gz, batch = sec_YYYYqN or xml_YYYYqN ----
+tpath <- function(tbl, batch) file.path(D$tables, tolower(tbl), paste0(batch, ".csv.gz"))
+
+write_tbl <- function(dt, tbl, batch) {
+  f <- tpath(tbl, batch)
+  dir.create(dirname(f), recursive = TRUE, showWarnings = FALSE)
+  tmp <- paste0(f, ".tmp")
+  fwrite(dt, tmp, compress = "gzip", na = "", scipen = 50L)
+  replace_file(tmp, f)
+}
+read_tbl <- function(tbl, batch) {
+  f <- tpath(tbl, batch)
+  if (!file.exists(f)) return(conform(NULL, tbl))
+  conform(fread(f, colClasses = "character", na.strings = "", encoding = "UTF-8", showProgress = FALSE), tbl)
+}
+delete_batch <- function(batch) {
+  for (tbl in TABLES) unlink(tpath(tbl, batch))
+  unlink(reg_file(batch))
+}
+
+# Registry: accession numbers stored in each batch, rebuilt from disk whenever out of date.
+reg_file <- function(batch) file.path(D$registry, paste0(batch, ".rds"))
+load_registry <- function() {
+  batches <- sub("\\.csv\\.gz$", "", list.files(file.path(D$tables, "submission"), pattern = "\\.csv\\.gz$"))
+  stale <- setdiff(sub("\\.rds$", "", list.files(D$registry, pattern = "\\.rds$")), batches)
+  unlink(reg_file(stale))
+  reg <- lapply(batches, function(b) {
+    rf <- reg_file(b); sf <- tpath("SUBMISSION", b)
+    if (!file.exists(rf) || file.mtime(rf) < file.mtime(sf)) {
+      acc <- fread(sf, select = "ACCESSION_NUMBER", colClasses = "character", na.strings = "",
+                   showProgress = FALSE)$ACCESSION_NUMBER
+      saveRDS(unique(acc), rf)
+    }
+    readRDS(rf)
+  })
+  setNames(reg, batches)
+}
+
+# Failures: filings in EDGAR's index that could not be stored, with the reason.
+FAIL_FILE <- file.path(D$state, "failures.csv")
+load_failures <- function() {
+  f <- if (file.exists(FAIL_FILE)) fread(FAIL_FILE, colClasses = "character", na.strings = "") else
+    data.table(ACCESSION_NUMBER = character(), FORM = character(), DATE_FILED = character(), FILENAME = character(),
+               REASON = character(), PERSISTENT_FAILS = character(), TRANSIENT_FAILS = character(),
+               LAST_ATTEMPT = character())
+  f[, `:=`(DATE_FILED = as.IDate(DATE_FILED), PERSISTENT_FAILS = as.integer(PERSISTENT_FAILS),
+           TRANSIENT_FAILS = as.integer(TRANSIENT_FAILS))]
+  f[]
+}
+save_failures <- function(f) { tmp <- paste0(FAIL_FILE, ".tmp"); fwrite(f, tmp); replace_file(tmp, FAIL_FILE) }
+```
+
+```{r xml-parser}
+# ---- Parse one filing (full submission .txt) into the eight tables ----
+xv <- function(nodes, xp) {                      # text of first match under each node
+  v <- trimws(gsub("\\s+", " ", xml_text(xml_find_first(nodes, xp))))
+  v[!is.na(v) & !nzchar(v)] <- NA_character_
+  v
+}
+xfn <- function(nodes, xp) vapply(seq_along(nodes), function(i) {   # footnote ids under each node
+  ids <- xml_attr(xml_find_all(nodes[[i]], xp), "id")
+  if (length(ids)) paste(ids, collapse = ",") else NA_character_
+}, character(1))
+
+vf <- function(col, path) setNames(c(paste0("./", path, "/value"), paste0("./", path, "/footnoteId")),
+                                   c(col, paste0(col, "_FN")))
+CODING <- c(TRANS_FORM_TYPE = "./transactionCoding/transactionFormType",
+            TRANS_CODE = "./transactionCoding/transactionCode",
+            EQUITY_SWAP_INVOLVED = "./transactionCoding/equitySwapInvolved",
+            EQUITY_SWAP_TRANS_CD_FN = "./transactionCoding/footnoteId")
+OWN_TAIL <- c(vf("SHRS_OWND_FOLWNG_TRANS", "postTransactionAmounts/sharesOwnedFollowingTransaction"),
+              vf("VALU_OWND_FOLWNG_TRANS", "postTransactionAmounts/valueOwnedFollowingTransaction"),
+              vf("DIRECT_INDIRECT_OWNERSHIP", "ownershipNature/directOrIndirectOwnership"),
+              vf("NATURE_OF_OWNERSHIP", "ownershipNature/natureOfOwnership"))
+UNDERLYING <- c(vf("UNDLYNG_SEC_TITLE", "underlyingSecurity/underlyingSecurityTitle"),
+                vf("UNDLYNG_SEC_SHARES", "underlyingSecurity/underlyingSecurityShares"),
+                vf("UNDLYNG_SEC_VALUE", "underlyingSecurity/underlyingSecurityValue"))
+
+XSPEC <- list(
+  NONDERIV_TRANS = list(node = "./nonDerivativeTable/nonDerivativeTransaction", sk = "NONDERIV_TRANS_SK",
+    cols = c(vf("SECURITY_TITLE", "securityTitle"), vf("TRANS_DATE", "transactionDate"),
+             vf("DEEMED_EXECUTION_DATE", "deemedExecutionDate"), CODING,
+             vf("TRANS_TIMELINESS", "transactionTimeliness"),
+             vf("TRANS_SHARES", "transactionAmounts/transactionShares"),
+             vf("TRANS_PRICEPERSHARE", "transactionAmounts/transactionPricePerShare"),
+             vf("TRANS_ACQUIRED_DISP_CD", "transactionAmounts/transactionAcquiredDisposedCode"), OWN_TAIL)),
+  NONDERIV_HOLDING = list(node = "./nonDerivativeTable/nonDerivativeHolding", sk = "NONDERIV_HOLDING_SK",
+    cols = c(vf("SECURITY_TITLE", "securityTitle"),
+             TRANS_FORM_TYPE = ".//transactionFormType", TRANS_FORM_TYPE_FN = "./transactionCoding/footnoteId",
+             OWN_TAIL)),
+  DERIV_TRANS = list(node = "./derivativeTable/derivativeTransaction", sk = "DERIV_TRANS_SK",
+    cols = c(vf("SECURITY_TITLE", "securityTitle"), vf("CONV_EXERCISE_PRICE", "conversionOrExercisePrice"),
+             vf("TRANS_DATE", "transactionDate"), vf("DEEMED_EXECUTION_DATE", "deemedExecutionDate"), CODING,
+             vf("TRANS_TIMELINESS", "transactionTimeliness"),
+             vf("TRANS_SHARES", "transactionAmounts/transactionShares"),
+             vf("TRANS_TOTAL_VALUE", "transactionAmounts/transactionTotalValue"),
+             vf("TRANS_PRICEPERSHARE", "transactionAmounts/transactionPricePerShare"),
+             vf("TRANS_ACQUIRED_DISP_CD", "transactionAmounts/transactionAcquiredDisposedCode"),
+             vf("EXCERCISE_DATE", "exerciseDate"), vf("EXPIRATION_DATE", "expirationDate"),
+             UNDERLYING, OWN_TAIL)),
+  DERIV_HOLDING = list(node = "./derivativeTable/derivativeHolding", sk = "DERIV_HOLDING_SK",
+    cols = c(vf("SECURITY_TITLE", "securityTitle"), vf("CONV_EXERCISE_PRICE", "conversionOrExercisePrice"),
+             TRANS_FORM_TYPE = ".//transactionFormType", TRANS_FORM_TYPE_FN = "./transactionCoding/footnoteId",
+             vf("EXERCISE_DATE", "exerciseDate"), vf("EXPIRATION_DATE", "expirationDate"),
+             UNDERLYING, OWN_TAIL))
+)
+stopifnot(all(unlist(lapply(names(XSPEC), function(t) names(XSPEC[[t]]$cols) %in% SCHEMA[[t]]))))
+
+rows_from <- function(nodes, cols, acc, sk) {
+  if (!length(nodes)) return(NULL)
+  out <- lapply(names(cols), function(c) if (endsWith(c, "_FN")) xfn(nodes, cols[[c]]) else xv(nodes, cols[[c]]))
+  dt <- as.data.table(setNames(out, names(cols)))
+  dt[, ACCESSION_NUMBER := acc]
+  if (!is.null(sk)) dt[, (sk) := as.character(seq_len(.N))]
+  dt
+}
+
+parse_filing <- function(raw, acc, date_fallback) {
+  txt <- raw_text(raw)
+  fd <- regmatches(txt, regexpr("FILED AS OF DATE:\\s*\\d{8}", txt, useBytes = TRUE))
+  filing_date <- if (length(fd)) gsub("\\D", "", fd) else as.character(date_fallback)
+
+  blocks <- regmatches(txt, gregexpr("(?s)<XML>.*?</XML>", txt, perl = TRUE, useBytes = TRUE))[[1]]
+  blocks <- blocks[grepl("<ownershipDocument", blocks, useBytes = TRUE)]
+  if (!length(blocks)) return(list(error = "no ownership XML in filing"))
+  xml <- sub("(?s)^<XML>\\s*", "", sub("(?s)\\s*</XML>$", "", blocks[1], perl = TRUE, useBytes = TRUE),
+             perl = TRUE, useBytes = TRUE)
+  doc <- tryCatch(read_xml(charToRaw(xml)), error = function(e) NULL)
+  if (is.null(doc)) doc <- tryCatch(read_xml(charToRaw(xml), options = c("RECOVER", "NOERROR")),
+                                    error = function(e) NULL)
+  if (is.null(doc)) return(list(error = "ownership XML could not be parsed"))
+  xml_ns_strip(doc)
+  root <- if (xml_name(doc) == "ownershipDocument") doc else xml_find_first(doc, "//ownershipDocument")
+  if (inherits(root, "xml_missing")) return(list(error = "no ownershipDocument element"))
+
+  out <- list()
+  out$SUBMISSION <- data.table(
+    ACCESSION_NUMBER = acc, FILING_DATE = filing_date,
+    PERIOD_OF_REPORT = xv(root, "./periodOfReport"), DATE_OF_ORIG_SUB = xv(root, "./dateOfOriginalSubmission"),
+    NO_SECURITIES_OWNED = xv(root, "./noSecuritiesOwned"), NOT_SUBJECT_SEC16 = xv(root, "./notSubjectToSection16"),
+    FORM3_HOLDING_REPORTED = xv(root, "./form3HoldingsReported"),
+    FORM4_TRANS_REPORTED = xv(root, "./form4TransactionsReported"), DOCUMENT_TYPE = xv(root, "./documentType"),
+    ISSUERCIK = xv(root, "./issuer/issuerCik"), ISSUERNAME = xv(root, "./issuer/issuerName"),
+    ISSUERTRADINGSYMBOL = xv(root, "./issuer/issuerTradingSymbol"), REMARKS = xv(root, "./remarks"),
+    AFF10B5ONE = xv(root, "./aff10b5One"), SOURCE = "EDGAR_XML")
+
+  on <- xml_find_all(root, "./reportingOwner")
+  if (length(on)) {
+    flags <- sapply(c("isDirector", "isOfficer", "isTenPercentOwner", "isOther"),
+                    function(f) to_bool(xv(on, paste0("./reportingOwnerRelationship/", f))))
+    flags <- matrix(flags, nrow = length(on))
+    rel <- apply(flags, 1, function(r) paste(c("Director", "Officer", "TenPercentOwner", "Other")[!is.na(r) & r == 1L],
+                                             collapse = ","))
+    out$REPORTINGOWNER <- data.table(
+      ACCESSION_NUMBER = acc, RPTOWNERCIK = xv(on, "./reportingOwnerId/rptOwnerCik"),
+      RPTOWNERNAME = xv(on, "./reportingOwnerId/rptOwnerName"), RPTOWNER_RELATIONSHIP = rel,
+      RPTOWNER_TITLE = xv(on, "./reportingOwnerRelationship/officerTitle"),
+      RPTOWNER_TXT = xv(on, "./reportingOwnerRelationship/otherText"),
+      RPTOWNER_STREET1 = xv(on, "./reportingOwnerAddress/rptOwnerStreet1"),
+      RPTOWNER_STREET2 = xv(on, "./reportingOwnerAddress/rptOwnerStreet2"),
+      RPTOWNER_CITY = xv(on, "./reportingOwnerAddress/rptOwnerCity"),
+      RPTOWNER_STATE = xv(on, "./reportingOwnerAddress/rptOwnerState"),
+      RPTOWNER_ZIPCODE = xv(on, "./reportingOwnerAddress/rptOwnerZipCode"),
+      RPTOWNER_STATE_DESC = xv(on, "./reportingOwnerAddress/rptOwnerStateDescription"),
+      IS_DIRECTOR = flags[, 1], IS_OFFICER = flags[, 2], IS_TENPERCENTOWNER = flags[, 3], IS_OTHER = flags[, 4])
+  }
+  for (t in names(XSPEC))
+    out[[t]] <- rows_from(xml_find_all(root, XSPEC[[t]]$node), XSPEC[[t]]$cols, acc, XSPEC[[t]]$sk)
+
+  fnodes <- xml_find_all(root, "./footnotes/footnote")
+  if (length(fnodes))
+    out$FOOTNOTES <- data.table(ACCESSION_NUMBER = acc, FOOTNOTE_ID = xml_attr(fnodes, "id"),
+                                FOOTNOTE_TXT = gsub("\\s+", " ", trimws(xml_text(fnodes))))
+  snodes <- xml_find_all(root, "./ownerSignature")
+  if (length(snodes))
+    out$OWNER_SIGNATURE <- data.table(ACCESSION_NUMBER = acc, OWNERSIGNATURENAME = xv(snodes, "./signatureName"),
+                                      OWNERSIGNATUREDATE = xv(snodes, "./signatureDate"))
+  out
+}
+
+# Add parsed filings to xml_YYYYqN batches (by filing date), replacing any earlier copy.
+append_xml <- function(tabs, reg) {
+  sub <- tabs$SUBMISSION
+  bq <- fifelse(is.na(sub$FILING_DATE), "unknown", qtag(as.Date(fcoalesce(sub$FILING_DATE, "1970-01-01"))))
+  for (b in unique(paste0("xml_", bq))) {
+    accs <- sub$ACCESSION_NUMBER[paste0("xml_", bq) == b]
+    for (tbl in WRITE_ORDER) {
+      old <- read_tbl(tbl, b)
+      new <- tabs[[tbl]][ACCESSION_NUMBER %in% accs]
+      comb <- rbind(old[!ACCESSION_NUMBER %in% accs], new)
+      setorderv(comb, "ACCESSION_NUMBER")
+      write_tbl(comb, tbl, b)
+    }
+    reg[[b]] <- unique(c(setdiff(reg[[b]] %||% character(), accs), accs))
+    saveRDS(reg[[b]], reg_file(b))
+  }
+  reg
+}
+```
+
+```{r index-functions}
+# ---- EDGAR index parsing ----
+EMPTY_IDX <- function() data.table(ACCESSION_NUMBER = character(), FORM = character(),
+                                   DATE_FILED = as.IDate(character()), FILENAME = character())
+parse_index_file <- function(path) {
+  con <- gzfile(path, "rb")
+  lines <- readLines(con, warn = FALSE)
+  close(con)
+  # Row format: CIK|Company Name|Form Type|Date Filed|Filename (company names may contain "|")
+  lines <- trimws(lines[grepl("\\|[345](/A)?\\|\\d{4}-?\\d{2}-?\\d{2}\\|edgar/", lines, perl = TRUE, useBytes = TRUE)])
+  if (!length(lines)) return(EMPTY_IDX())
+  file <- sub("^.*\\|", "", lines, perl = TRUE, useBytes = TRUE)
+  rest <- sub("\\|[^|]*$", "", lines, perl = TRUE, useBytes = TRUE)
+  date <- sub("^.*\\|", "", rest, perl = TRUE, useBytes = TRUE)
+  rest <- sub("\\|[^|]*$", "", rest, perl = TRUE, useBytes = TRUE)
+  form <- sub("^.*\\|", "", rest, perl = TRUE, useBytes = TRUE)
+  dt <- data.table(ACCESSION_NUMBER = sub("\\.txt$", "", sub("^.*/", "", file)), FORM = form,
+                   DATE_FILED = as.IDate(to_iso(date)), FILENAME = file)
+  unique(dt[FORM %in% FORMS & grepl(ACC_RE, ACCESSION_NUMBER) & !is.na(DATE_FILED)], by = "ACCESSION_NUMBER")
+}
+
+# Full quarterly index. Cached permanently once fetched more than 7 days after quarter end.
+get_quarter_index <- function(qs) {
+  tag <- qtag(qs)
+  cache <- file.path(D$index, paste0(tag, ".rds"))
+  if (file.exists(cache)) {
+    c0 <- readRDS(cache)
+    if (c0$fetched > q_end(qs) + 7) return(list(idx = c0$idx, ok = TRUE))
+  }
+  for (f in c("master.gz", "master.idx")) {
+    url <- sprintf("%s/Archives/edgar/full-index/%s/QTR%s/%s", BASE, substr(tag, 1, 4), substr(tag, 6, 6), f)
+    tmp <- tempfile(fileext = paste0("_", f))
+    st <- sec_fetch_disk(url, tmp)
+    if (st == 200L) {
+      idx <- parse_index_file(tmp)
+      unlink(tmp)
+      if (!nrow(idx) && q_end(qs) < AS_OF - 7)
+        stop("EDGAR index for ", tag, " was downloaded but no Form 3/4/5 rows were recognized. ",
+             "The index format may have changed; stopping so nothing is silently missed.")
+      saveRDS(list(fetched = Sys.Date(), idx = idx), cache)
+      return(list(idx = idx, ok = TRUE))
+    }
+  }
+  if (file.exists(cache)) {
+    log_msg("Could not refresh EDGAR index for ", tag, "; using the copy from ", c0$fetched)
+    return(list(idx = c0$idx, ok = FALSE))
+  }
+  # A brand-new quarter may not have a full index yet; the daily indexes cover it.
+  list(idx = EMPTY_IDX(), ok = AS_OF - qs <= 10)
+}
+
+get_daily_index <- function(d) {
+  url <- sprintf("%s/Archives/edgar/daily-index/%s/QTR%s/master.%s.idx",
+                 BASE, format(d, "%Y"), substr(qtag(d), 6, 6), format(d, "%Y%m%d"))
+  tmp <- tempfile(fileext = ".idx")
+  st <- sec_fetch_disk(url, tmp)
+  if (st != 200L) return(NULL)              # weekend, holiday, or not published yet
+  on.exit(unlink(tmp))
+  parse_index_file(tmp)
+}
+
+# Today's filings (EDGAR's live feed). Best effort; tomorrow's index confirms them.
+get_current_filings <- function() {
+  rx1 <- function(x, p) vapply(regmatches(x, regexec(p, x, perl = TRUE, useBytes = TRUE)),
+                               function(v) if (length(v) >= 2) v[2] else NA_character_, character(1))
+  out <- list(); seen <- character()
+  for (ty in unique(sub("/A$", "", FORMS))) {
+    for (pg in 0:49) {
+      url <- sprintf("%s/cgi-bin/browse-edgar?action=getcurrent&type=%s&company=&dateb=&owner=include&start=%d&count=100&output=atom",
+                     BASE, ty, pg * 100)
+      r <- sec_fetch(url)
+      if (r$status != 200L) break
+      txt <- raw_text(r$raw)
+      ent <- regmatches(txt, gregexpr("(?s)<entry>.*?</entry>", txt, perl = TRUE, useBytes = TRUE))[[1]]
+      if (!length(ent)) break
+      acc  <- rx1(ent, "accession-number=(\\d{10}-\\d{2}-\\d{6})")
+      acc  <- fifelse(is.na(acc), rx1(ent, "(\\d{10}-\\d{2}-\\d{6})"), acc)
+      cik  <- rx1(ent, "/Archives/edgar/data/(\\d+)/")
+      form <- rx1(ent, "term=\"([^\"]+)\"")
+      upd  <- as.Date(substr(rx1(ent, "<updated>([^<]+)</updated>"), 1, 10))
+      new  <- !is.na(acc) & !acc %in% seen
+      if (!any(new)) break
+      seen <- c(seen, acc)
+      keep <- new & form %in% FORMS & !is.na(cik) & (is.na(upd) | upd == AS_OF)
+      if (any(keep))
+        out[[length(out) + 1]] <- data.table(ACCESSION_NUMBER = acc[keep], FORM = form[keep],
+                                             DATE_FILED = as.IDate(AS_OF),
+                                             FILENAME = sprintf("edgar/data/%s/%s.txt", cik[keep], acc[keep]))
+      if (length(ent) < 100 || all(!is.na(upd) & upd < AS_OF)) break
+    }
+  }
+  res <- rbindlist(out)
+  if (nrow(res)) unique(res, by = "ACCESSION_NUMBER") else NULL
+}
+```
+
+## 1. SEC quarterly data sets
+
+```{r step1-sec}
+t1 <- Sys.time()
+SEC_STATE <- file.path(D$state, "sec_datasets.csv")
+sec_state <- if (file.exists(SEC_STATE)) fread(SEC_STATE, colClasses = "character") else
+  data.table(tag = character(), url = character(), size = character(), last_modified = character(),
+             ingested_at = character())
+
+page <- sec_fetch(paste0(BASE, "/data-research/sec-markets-data/insider-transactions-data-sets"))
+if (page$status != 200L) stop("Could not load the SEC Insider Transactions Data Sets page (HTTP ", page$status, ").")
+html  <- raw_text(page$raw)
+hrefs <- regmatches(html, gregexpr("href=[\"'][^\"']*?\\d{4}q[1-4]_form345\\.zip[\"']", html, perl = TRUE))[[1]]
+hrefs <- gsub("^href=[\"']|[\"']$", "", hrefs)
+urls  <- ifelse(grepl("^https?://", hrefs), sub("^https?://[^/]+", BASE, hrefs),
+                paste0(BASE, ifelse(startsWith(hrefs, "/"), "", "/"), hrefs))
+sec_list <- unique(data.table(tag = sub(".*(\\d{4}q[1-4])_form345\\.zip$", "\\1", urls), url = urls), by = "tag")
+sec_list <- sec_list[q_end(tag_start(tag)) >= START & tag_start(tag) <= AS_OF][order(tag)]
+if (!nrow(sec_list)) stop("No quarterly data set links were found on the SEC page. Its layout may have changed.")
+
+expected <- qtag(seq(max(q_start(START), as.Date("2006-01-01")), q_start(AS_OF), by = "quarter"))
+not_listed <- setdiff(expected, sec_list$tag)
+if (length(not_listed))
+  log_msg("SEC data sets not (yet) published for: ", paste(not_listed, collapse = ", "),
+          ". Those filings are fetched individually from EDGAR.")
+
+reg <- load_registry()
+
+ingest_sec <- function(zipf, tag) {
+  batch <- paste0("sec_", tag)
+  inside <- unzip(zipf, list = TRUE)$Name
+  ex <- tempfile("sec_")
+  dir.create(ex)
+  on.exit(unlink(ex, recursive = TRUE), add = TRUE)
+  tabs <- list()
+  for (tbl in TABLES) {
+    f <- inside[toupper(basename(inside)) == paste0(tbl, ".TSV")]
+    if (!length(f)) {
+      if (tbl == "SUBMISSION") stop(basename(zipf), " contains no SUBMISSION.tsv")
+      log_msg(tag, ": ", tbl, ".tsv not in zip; treated as empty")
+      tabs[[tbl]] <- conform(NULL, tbl)
+      next
+    }
+    path <- unzip(zipf, files = f[1], exdir = ex, junkpaths = TRUE)
+    dt <- fread(path, sep = "\t", quote = "", header = TRUE, colClasses = "character", na.strings = "",
+                fill = TRUE, encoding = "UTF-8", showProgress = FALSE)
+    setnames(dt, toupper(trimws(sub("^\ufeff", "", names(dt)))))
+    miss <- setdiff(REQUIRED[[tbl]] %||% "ACCESSION_NUMBER", names(dt))
+    if (length(miss)) stop(tag, " ", tbl, " is missing required columns: ", paste(miss, collapse = ", "),
+                           ". The SEC may have changed its format; stopping so nothing is silently wrong.")
+    opt <- setdiff(setdiff(SCHEMA[[tbl]], ADDED_COLS), names(dt))
+    if (length(opt)) log_msg(tag, " ", tbl, ": columns not in this quarter's file (left blank): ", paste(opt, collapse = ", "))
+    bad <- is.na(dt$ACCESSION_NUMBER) | !grepl(ACC_RE, dt$ACCESSION_NUMBER)
+    if (any(bad)) {
+      log_msg(tag, " ", tbl, ": dropped ", sum(bad), " malformed row(s)")
+      dt <- dt[!bad]
+    }
+    if (tbl == "REPORTINGOWNER" && "RPTOWNER_RELATIONSHIP" %in% names(dt)) {
+      rel <- toupper(fcoalesce(dt$RPTOWNER_RELATIONSHIP, ""))
+      dt[, `:=`(IS_DIRECTOR = as.integer(grepl("DIRECTOR", rel)), IS_OFFICER = as.integer(grepl("OFFICER", rel)),
+                IS_TENPERCENTOWNER = as.integer(grepl("TEN|10", rel)), IS_OTHER = as.integer(grepl("OTHER", rel)))]
+    }
+    if (tbl == "SUBMISSION") dt[, SOURCE := "SEC_DATASET"]
+    dt <- conform(dt, tbl)
+    tabs[[tbl]] <- if (tbl == "SUBMISSION") unique(dt, by = "ACCESSION_NUMBER") else unique(dt)
+  }
+  # A filing stored in another SEC quarter stays there; drop it here.
+  other <- unlist(reg[setdiff(grep("^sec_", names(reg), value = TRUE), batch)], use.names = FALSE)
+  dup <- intersect(tabs$SUBMISSION$ACCESSION_NUMBER, other)
+  if (length(dup)) log_msg(tag, ": ", length(dup), " filing(s) already stored from another SEC quarter; kept there")
+  keep <- setdiff(tabs$SUBMISSION$ACCESSION_NUMBER, dup)
+  for (tbl in setdiff(TABLES, "SUBMISSION")) {
+    orphans <- sum(!tabs[[tbl]]$ACCESSION_NUMBER %in% tabs$SUBMISSION$ACCESSION_NUMBER)
+    if (orphans) log_msg(tag, " ", tbl, ": ", orphans, " row(s) with no SUBMISSION row removed")
+  }
+  for (tbl in TABLES) tabs[[tbl]] <- tabs[[tbl]][ACCESSION_NUMBER %in% keep]
+  for (tbl in WRITE_ORDER) write_tbl(tabs[[tbl]], tbl, batch)
+  saveRDS(keep, reg_file(batch))
+  keep
+}
+
+# SEC versions replace parsed copies of the same filing.
+purge_xml <- function(accs) {
+  for (b in grep("^xml_", names(reg), value = TRUE)) {
+    hit <- reg[[b]] %in% accs
+    if (!any(hit)) next
+    keep <- reg[[b]][!hit]
+    if (!length(keep)) {
+      delete_batch(b)
+      reg[[b]] <<- NULL
+    } else {
+      for (tbl in WRITE_ORDER) { dt <- read_tbl(tbl, b); write_tbl(dt[ACCESSION_NUMBER %in% keep], tbl, b) }
+      saveRDS(keep, reg_file(b))
+      reg[[b]] <<- keep
+    }
+    log_msg(b, ": ", sum(hit), " parsed filing(s) replaced by the SEC data set version")
+  }
+}
+
+sec_log <- list()
+for (i in seq_len(nrow(sec_list))) {
+  tag <- sec_list$tag[i]; url <- sec_list$url[i]; batch <- paste0("sec_", tag)
+  h <- sec_fetch(url, nobody = TRUE)
+  hdr <- if (h$status == 200L) parse_headers_list(h$headers) else list()
+  size <- as.character(hdr[["content-length"]] %||% NA)
+  lm   <- as.character(hdr[["last-modified"]] %||% NA)
+  prev <- sec_state[tag == sec_list$tag[i]]
+  have_files <- file.exists(tpath("SUBMISSION", batch))
+  if (nrow(prev) && have_files && (h$status != 200L || (identical(prev$size, size) && identical(prev$last_modified, lm)))) {
+    if (h$status != 200L) log_msg(tag, ": could not check for an SEC update (HTTP ", h$status, "); keeping stored copy")
+    next
+  }
+  reason <- if (!nrow(prev) || !have_files) "new" else "re-published by the SEC"
+  zipf <- file.path(D$zips, basename(url))
+  st <- sec_fetch_disk(url, zipf)
+  if (st != 200L) { log_msg(tag, ": download failed (HTTP ", st, "); filings will be fetched individually"); next }
+  accs <- ingest_sec(zipf, tag)
+  reg[[batch]] <- accs
+  purge_xml(accs)
+  if (!isTRUE(P$keep_zips)) unlink(zipf)
+  sec_state <- rbind(sec_state[tag != sec_list$tag[i]],
+                     data.table(tag = sec_list$tag[i], url = url, size = size, last_modified = lm,
+                                ingested_at = format(Sys.time())))
+  tmp <- paste0(SEC_STATE, ".tmp"); fwrite(sec_state, tmp); replace_file(tmp, SEC_STATE)
+  sec_log[[length(sec_log) + 1]] <- data.table(Quarter = tag, Action = reason, Filings = length(accs))
+  log_msg(tag, ": ingested (", reason, "), ", length(accs), " filings")
+}
+sec_log <- rbindlist(sec_log)
+say(sprintf("SEC data sets available: %d (%s to %s). Ingested this run: %d. Took %s.",
+            nrow(sec_list), min(sec_list$tag), max(sec_list$tag), nrow(sec_log), fmt_min(t1)))
+if (nrow(sec_log)) show(sec_log)
+```
+
+## 2. EDGAR filing index (the complete list)
+
+```{r step2-index}
+t2 <- Sys.time()
+have <- unique(unlist(reg, use.names = FALSE))
+fails <- load_failures()
+fails <- fails[!ACCESSION_NUMBER %in% have]             # stored since (e.g. by a new SEC quarter)
+
+quarters <- seq(q_start(START), q_start(AS_OF), by = "quarter")
+coverage <- vector("list", length(quarters))
+todo <- vector("list", length(quarters))
+recent_known <- character()
+for (i in seq_along(quarters)) {
+  r <- get_quarter_index(quarters[i])
+  idx <- r$idx[DATE_FILED >= START & DATE_FILED <= AS_OF]
+  if (quarters[i] >= q_start(AS_OF - 20)) recent_known <- c(recent_known, idx$ACCESSION_NUMBER)
+  miss <- idx[!ACCESSION_NUMBER %in% have]
+  coverage[[i]] <- data.table(QUARTER = qtag(quarters[i]), INDEX_OK = r$ok, IN_INDEX = nrow(idx))
+  todo[[i]] <- miss
+}
+coverage <- rbindlist(coverage)
+
+# Recent days: daily indexes (published nightly) plus today's live feed.
+d_to <- if (LIVE) AS_OF - 1 else AS_OF                  # today's daily index appears only at night
+days <- if (d_to >= max(START, AS_OF - 10)) seq(max(START, AS_OF - 10), d_to, by = "day") else as.Date(character())
+days <- days[!format(days, "%u") %in% c("6", "7")]
+recent <- rbindlist(c(lapply(days, get_daily_index), list(if (LIVE) get_current_filings())))
+if (nrow(recent)) {
+  recent <- unique(recent[DATE_FILED >= START & DATE_FILED <= AS_OF & !ACCESSION_NUMBER %in% recent_known],
+                   by = "ACCESSION_NUMBER")
+  if (nrow(recent)) {
+    extra <- recent[, .(EXTRA = .N), by = .(QUARTER = qtag(as.Date(DATE_FILED)))]
+    coverage <- merge(coverage, extra, by = "QUARTER", all.x = TRUE)
+    coverage[, IN_INDEX := IN_INDEX + fcoalesce(EXTRA, 0L)][, EXTRA := NULL]
+  }
+  todo[[length(todo) + 1]] <- recent[!ACCESSION_NUMBER %in% have]
+}
+todo <- unique(rbindlist(todo), by = "ACCESSION_NUMBER")
+setorder(todo, DATE_FILED)
+
+given_up <- fails[PERSISTENT_FAILS >= MAXPF, ACCESSION_NUMBER]
+skipped  <- todo[ACCESSION_NUMBER %in% given_up]
+todo     <- todo[!ACCESSION_NUMBER %in% given_up]
+
+say(sprintf("Filings in EDGAR's index %s to %s: %s. Already stored: %s. To download now: %s%s. Took %s.",
+            START, AS_OF, format(sum(coverage$IN_INDEX), big.mark = ","),
+            format(sum(coverage$IN_INDEX) - nrow(todo) - nrow(skipped), big.mark = ","),
+            format(nrow(todo), big.mark = ","),
+            if (nrow(skipped)) sprintf(" (%d unrecoverable skipped)", nrow(skipped)) else "", fmt_min(t2)))
+if (nrow(todo)) {
+  est <- nrow(todo) / RATE / 60 * 1.05
+  say(sprintf("Estimated download time at %g requests/sec: about %s.", RATE,
+              if (est < 1) sprintf("%.0f sec", est * 60) else if (est < 120) sprintf("%.0f min", est) else sprintf("%.1f hours", est / 60)))
+}
+```
+
+## 3. Download missing filings
+
+```{r step3-fetch}
+t3 <- Sys.time()
+stored_now <- character()
+if (nrow(todo)) {
+  chunks <- split(seq_len(nrow(todo)), ceiling(seq_len(nrow(todo)) / CHUNK))
+  log_msg("Fetching ", nrow(todo), " filings in ", length(chunks), " chunk(s)")
+  for (ci in seq_along(chunks)) {
+    rows <- todo[chunks[[ci]]]
+    urls <- paste0(BASE, "/Archives/", rows$FILENAME)
+    res  <- fetch_many(urls)
+    st   <- vapply(res, `[[`, integer(1), "status")
+    for (j in which(!st %in% c(200L, 404L))) { res[[j]] <- sec_fetch(urls[j]); st[j] <- res[[j]]$status }
+
+    parsed  <- vector("list", nrow(rows))
+    outcome <- character(nrow(rows))
+    for (j in seq_len(nrow(rows))) {
+      if (st[j] == 404L) { outcome[j] <- "not found on EDGAR"; next }
+      if (st[j] != 200L) { outcome[j] <- sprintf("download failed (HTTP %d)", st[j]); next }
+      p <- tryCatch(parse_filing(res[[j]]$raw, rows$ACCESSION_NUMBER[j], rows$DATE_FILED[j]),
+                    error = function(e) list(error = paste("parse error:", conditionMessage(e))))
+      if (!is.null(p$error)) outcome[j] <- p$error else { parsed[[j]] <- p; outcome[j] <- "ok" }
+    }
+    rm(res)
+    ok <- outcome == "ok"
+    if (any(ok)) {
+      tabs <- setNames(lapply(TABLES, function(t) conform(rbindlist(lapply(parsed[ok], `[[`, t), fill = TRUE), t)), TABLES)
+      reg <- append_xml(tabs, reg)
+      stored_now <- c(stored_now, rows$ACCESSION_NUMBER[ok])
+    }
+
+    # Update the failure log: successes cleared, failures counted by kind.
+    fails <- fails[!ACCESSION_NUMBER %in% rows$ACCESSION_NUMBER[ok]]
+    if (any(!ok)) {
+      bad <- rows[!ok][, REASON := outcome[!ok]]
+      transient <- startsWith(bad$REASON, "download failed")
+      prev <- fails[match(bad$ACCESSION_NUMBER, fails$ACCESSION_NUMBER)]
+      bad[, `:=`(PERSISTENT_FAILS = fcoalesce(prev$PERSISTENT_FAILS, 0L) + as.integer(!transient),
+                 TRANSIENT_FAILS  = fcoalesce(prev$TRANSIENT_FAILS, 0L) + as.integer(transient),
+                 LAST_ATTEMPT = format(Sys.time()))]
+      fails <- rbind(fails[!ACCESSION_NUMBER %in% bad$ACCESSION_NUMBER], bad, fill = TRUE)
+    }
+    save_failures(fails)
+
+    done <- sum(lengths(chunks[seq_len(ci)]))
+    el <- as.numeric(difftime(Sys.time(), t3, units = "mins"))
+    left <- el / done * (nrow(todo) - done)
+    log_msg(sprintf("Chunk %d/%d: %s/%s filings done, %d failed this chunk | %s elapsed, ~%s left",
+                    ci, length(chunks), format(done, big.mark = ","), format(nrow(todo), big.mark = ","), sum(!ok),
+                    fmt_min(t3), if (left < 1) sprintf("%.0f sec", left * 60) else if (left < 120) sprintf("%.0f min", left)
+                    else sprintf("%.1f hours", left / 60)))
+  }
+}
+say(sprintf("Downloaded and stored %s filing(s) in %s.", format(length(stored_now), big.mark = ","), fmt_min(t3)))
+```
+
+## 4. Completeness report
+
+```{r step4-report}
+have <- unique(unlist(reg, use.names = FALSE))
+all_acc <- unlist(reg, use.names = FALSE)
+n_dup <- sum(duplicated(all_acc))
+
+missing <- rbind(todo[!ACCESSION_NUMBER %in% have], skipped)
+missing[, QUARTER := qtag(as.Date(DATE_FILED))]
+missing[, STATUS := fifelse(ACCESSION_NUMBER %in% fails[PERSISTENT_FAILS >= MAXPF, ACCESSION_NUMBER],
+                            "unrecoverable", "will retry next run")]
+cov <- merge(coverage, missing[, .(NOT_STORED = .N, UNRECOVERABLE = sum(STATUS == "unrecoverable")), by = QUARTER],
+             by = "QUARTER", all.x = TRUE)
+cov[is.na(NOT_STORED), `:=`(NOT_STORED = 0L, UNRECOVERABLE = 0L)]
+cov[, STORED := IN_INDEX - NOT_STORED]
+cov[, PCT_STORED := round(100 * STORED / pmax(IN_INDEX, 1), 3)]
+fwrite(cov, file.path(D$state, "completeness_by_quarter.csv"))
+
+index_problems <- cov[INDEX_OK == FALSE, QUARTER]
+complete <- !length(index_problems) && !nrow(missing) && n_dup == 0
+verdict <- if (complete) {
+  sprintf("COMPLETE: all %s Form %s filings in EDGAR's index from %s to %s are stored.",
+          format(sum(cov$IN_INDEX), big.mark = ","), paste(FORMS, collapse = "/"), START, AS_OF)
+} else {
+  paste(c(
+    if (nrow(missing)) sprintf("%s filing(s) in EDGAR's index are not stored (%d unrecoverable, %d will be retried next run). See %s.",
+                               format(nrow(missing), big.mark = ","), sum(missing$STATUS == "unrecoverable"),
+                               sum(missing$STATUS != "unrecoverable"), FAIL_FILE),
+    if (length(index_problems)) sprintf("EDGAR's index could not be checked for: %s.", paste(index_problems, collapse = ", ")),
+    if (n_dup) sprintf("%d filing(s) are stored in more than one batch.", n_dup)), collapse = " ")
+}
+log_msg(if (complete) verdict else paste("INCOMPLETE:", verdict))
+say(if (complete) verdict else paste("INCOMPLETE:", verdict))
+```
+
+```{r step4-table}
+yr <- cov[, .(`In EDGAR index` = sum(IN_INDEX), Stored = sum(STORED), `Not stored` = sum(NOT_STORED),
+              `% stored` = round(100 * sum(STORED) / pmax(sum(IN_INDEX), 1), 3)), by = .(Year = substr(QUARTER, 1, 4))]
+show(yr)
+if (nrow(missing)) {
+  reasons <- merge(missing[, .(ACCESSION_NUMBER, STATUS)], fails[, .(ACCESSION_NUMBER, REASON)],
+                   by = "ACCESSION_NUMBER", all.x = TRUE)[, .N, by = .(REASON = fcoalesce(REASON, "not attempted"), STATUS)]
+  say("")
+  show(reasons[order(-N)], caption = "Filings not stored, by reason")
+}
+```
+
+## 5. Stored data
+
+```{r step5-summary}
+sizes <- sapply(TABLES, function(t) sum(file.size(list.files(file.path(D$tables, tolower(t)), full.names = TRUE))))
+src <- data.table(batch = names(reg), filings = lengths(reg))[, .(Filings = sum(filings)),
+                  by = .(Source = fifelse(startsWith(batch, "sec_"), "SEC quarterly data set", "Parsed from EDGAR filing"))]
+show(src)
+say("")
+say(sprintf("Total on disk: %.1f MB in %s", sum(sizes) / 1e6, normalizePath(D$tables)))
+btags <- sub("^(sec|xml)_", "", names(reg))
+latest_b <- names(reg)[btags != "unknown" & btags == max(btags[btags != "unknown"])]
+if (length(latest_b))
+  say(sprintf("Latest filing date stored: %s",
+              max(unlist(lapply(latest_b, function(b) read_tbl("SUBMISSION", b)$FILING_DATE)), na.rm = TRUE)))
+
+writeLines(c(format(Sys.time()), if (complete) "COMPLETE" else "INCOMPLETE", verdict),
+           file.path(D$state, "last_run.txt"))
+unlink(LOCK)
+log_msg(sprintf("==== Run finished in %.1f min", as.numeric(difftime(Sys.time(), RUN_START, units = "mins"))))
+```
+
+Load the data with `read_insider.R`:
+
+```r
+source("read_insider.R")
+trades <- read_insider_trades(from = "2020-01-01", codes = c("P", "S"))   # one row per transaction, with issuer and owner
+nd     <- read_insider("nonderiv_trans", from = "2024-01-01")              # any of the 8 tables, with filing info
+```

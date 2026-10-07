@@ -1,0 +1,165 @@
+---
+title: "All Insider Transactions in One Table"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output: html_document
+params:
+  data_dir: "insider_data"       # folder for storing SEC-reported insider data
+  from: ""                       # leave 'from' and 'to' blank to include all data
+  to: ""                         # 
+  include_derivative: true       # include derivative transactions
+  save_to: "insider_all.rds"     # save the data.table as an .rds file
+---
+
+<!--
+Builds ONE data.table, `insider`, from everything 01_insider_pipeline.Rmd has stored:
+one row per reported transaction (Forms 3/4/5 and amendments) with filing, issuer and
+reporting-owner info on every row.
+
+HOW TO USE
+  * Knit it: the result is saved to save_to (default insider_all.rds). Load it anywhere with
+      insider <- readRDS("insider_all.rds")
+    (Knitting runs in a separate R session, so the table itself doesn't stay in your environment.)
+  * Or open it in RStudio and use Run All: `insider` is then in your environment directly.
+
+NOTES
+  * ISSUERCIK and RPTOWNERCIK are integers.
+  * A filing can have several reporting owners (e.g. an executive and their trust). To keep one row
+    per transaction, RPTOWNERCIK / RPTOWNERNAME / RPTOWNER_TITLE are the first-listed owner; IS_* flags
+    are 1 if ANY owner has that role; N_OWNERS counts them; ALL_OWNER_CIKS lists all owner CIKs when
+    there is more than one.
+  * DERIVATIVE = 0 for stock transactions, 1 for options/RSUs/warrants etc.
+  * Amendments (DOCUMENT_TYPE "4/A" etc.) are included; filter them out if you only want originals.
+  * Holdings-only rows and footnote text are not transactions and are not included.
+  * The full 2006-present history is large (tens of millions of rows, several GB of RAM).
+    Set `from` to limit it, e.g. from: "2009-01-01".
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = TRUE)
+suppressPackageStartupMessages(library(data.table))
+if (!requireNamespace("R.utils", quietly = TRUE)) stop("install.packages('R.utils') is needed to read .csv.gz files")
+```
+
+```{r config}
+DATA_DIR           <- params$data_dir
+FROM               <- if (nzchar(params$from)) params$from else NULL
+TO                 <- if (nzchar(params$to)) params$to else NULL
+INCLUDE_DERIVATIVE <- isTRUE(params$include_derivative)
+SAVE_TO            <- if (nzchar(params$save_to)) params$save_to else NULL
+if (!dir.exists(file.path(DATA_DIR, "tables"))) stop("No data found at ", normalizePath(DATA_DIR, mustWork = FALSE),
+                                                     ". Run 01_insider_pipeline.Rmd first, or set data_dir.")
+t0 <- Sys.time()
+```
+
+```{r read-helper}
+# read one table, only the needed quarter files and columns
+.read <- function(tbl, cols) {
+  files <- list.files(file.path(DATA_DIR, "tables", tbl), pattern = "\\.csv\\.gz$", full.names = TRUE)
+  if (!length(files)) stop("No files found for '", tbl, "' in ", DATA_DIR, ". Has 01_insider_pipeline.Rmd been run?")
+  tags <- sub("^(sec|xml)_", "", sub("\\.csv\\.gz$", "", basename(files)))
+  qs <- suppressWarnings(as.Date(sprintf("%s-%02d-01", substr(tags, 1, 4), (as.integer(substr(tags, 6, 6)) - 1) * 3 + 1), format = "%Y-%m-%d"))
+  keep <- is.na(qs)
+  lo <- if (is.null(FROM)) as.Date("1900-01-01") else as.Date(FROM) - 185   # late filings can sit a quarter back
+  hi <- if (is.null(TO)) as.Date("2999-12-31") else as.Date(TO)
+  files <- files[keep | (!is.na(qs) & qs >= lo & qs <= hi)]
+  rbindlist(lapply(files, fread, select = cols, colClasses = "character", na.strings = "",
+                   encoding = "UTF-8", showProgress = FALSE), fill = TRUE)
+}
+.int <- function(x) suppressWarnings(as.integer(x))
+.date <- function(x) as.IDate(x, format = "%Y-%m-%d")   # explicit format: safe even if a column is all missing
+.num <- function(x) suppressWarnings(as.numeric(x))
+```
+
+```{r filings}
+# filings
+sub <- .read("submission", c("ACCESSION_NUMBER", "FILING_DATE", "DOCUMENT_TYPE", "PERIOD_OF_REPORT",
+                             "ISSUERCIK", "ISSUERNAME", "ISSUERTRADINGSYMBOL", "AFF10B5ONE"))
+sub[, `:=`(FILING_DATE = .date(FILING_DATE), PERIOD_OF_REPORT = .date(PERIOD_OF_REPORT),
+           ISSUERCIK = .int(ISSUERCIK), AFF10B5ONE = .int(AFF10B5ONE))]
+if (!is.null(FROM)) sub <- sub[FILING_DATE >= as.IDate(FROM)]
+if (!is.null(TO))   sub <- sub[FILING_DATE <= as.IDate(TO)]
+sub <- unique(sub, by = "ACCESSION_NUMBER")
+```
+
+```{r owners}
+# reporting owners, collapsed to one row per filing
+own <- .read("reportingowner", c("ACCESSION_NUMBER", "RPTOWNERCIK", "RPTOWNERNAME", "RPTOWNER_TITLE",
+                                 "IS_DIRECTOR", "IS_OFFICER", "IS_TENPERCENTOWNER", "IS_OTHER"))
+own <- own[ACCESSION_NUMBER %in% sub$ACCESSION_NUMBER]
+flags <- c("IS_DIRECTOR", "IS_OFFICER", "IS_TENPERCENTOWNER", "IS_OTHER")
+for (f in flags) set(own, j = f, value = fcoalesce(.int(own[[f]]), 0L))
+own_flags <- own[, c(lapply(.SD, max), list(N_OWNERS = .N)), by = ACCESSION_NUMBER, .SDcols = flags]
+own_first <- unique(own, by = "ACCESSION_NUMBER")[, .(ACCESSION_NUMBER, RPTOWNERCIK = .int(RPTOWNERCIK),
+                                                      RPTOWNERNAME, RPTOWNER_TITLE)]
+multi <- own_flags[N_OWNERS > 1, ACCESSION_NUMBER]
+own_all <- own[ACCESSION_NUMBER %in% multi, .(ALL_OWNER_CIKS = paste(RPTOWNERCIK, collapse = ";")), by = ACCESSION_NUMBER]
+owners <- merge(merge(own_first, own_flags, by = "ACCESSION_NUMBER"), own_all, by = "ACCESSION_NUMBER", all.x = TRUE)
+rm(own, own_flags, own_first, own_all)
+```
+
+```{r transactions}
+# transactions
+tcols <- c("ACCESSION_NUMBER", "SECURITY_TITLE", "TRANS_DATE", "DEEMED_EXECUTION_DATE", "TRANS_FORM_TYPE",
+           "TRANS_CODE", "EQUITY_SWAP_INVOLVED", "TRANS_TIMELINESS", "TRANS_SHARES", "TRANS_PRICEPERSHARE",
+           "TRANS_ACQUIRED_DISP_CD", "SHRS_OWND_FOLWNG_TRANS", "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP")
+nd <- .read("nonderiv_trans", c(tcols, "NONDERIV_TRANS_SK"))
+setnames(nd, "NONDERIV_TRANS_SK", "TRANS_SK")
+nd[, DERIVATIVE := 0L]
+tr <- list(nd)
+if (INCLUDE_DERIVATIVE) {
+  dv <- .read("deriv_trans", c(tcols, "DERIV_TRANS_SK", "TRANS_TOTAL_VALUE", "CONV_EXERCISE_PRICE",
+                               "EXCERCISE_DATE", "EXPIRATION_DATE", "UNDLYNG_SEC_TITLE", "UNDLYNG_SEC_SHARES"))
+  setnames(dv, c("DERIV_TRANS_SK", "EXCERCISE_DATE"), c("TRANS_SK", "EXERCISE_DATE"))  # SEC misspells it
+  dv[, DERIVATIVE := 1L]
+  tr[[2]] <- dv
+}
+tr <- rbindlist(tr, fill = TRUE)
+rm(nd); if (INCLUDE_DERIVATIVE) rm(dv)
+tr <- tr[ACCESSION_NUMBER %in% sub$ACCESSION_NUMBER]
+
+for (c in intersect(c("TRANS_DATE", "DEEMED_EXECUTION_DATE", "EXERCISE_DATE", "EXPIRATION_DATE"), names(tr)))
+  set(tr, j = c, value = .date(tr[[c]]))
+for (c in intersect(c("TRANS_SHARES", "TRANS_PRICEPERSHARE", "SHRS_OWND_FOLWNG_TRANS", "TRANS_TOTAL_VALUE",
+                      "CONV_EXERCISE_PRICE", "UNDLYNG_SEC_SHARES", "TRANS_SK"), names(tr)))
+  set(tr, j = c, value = .num(tr[[c]]))
+tr[, EQUITY_SWAP_INVOLVED := .int(EQUITY_SWAP_INVOLVED)]
+tr[, TRANS_VALUE := TRANS_SHARES * TRANS_PRICEPERSHARE]
+```
+
+```{r combine}
+# one dataframe
+insider <- merge(sub, owners, by = "ACCESSION_NUMBER", all.x = TRUE)[tr, on = "ACCESSION_NUMBER", nomatch = NULL]
+rm(sub, owners, tr); invisible(gc())
+
+front <- c("FILING_DATE", "ACCESSION_NUMBER", "DOCUMENT_TYPE", "ISSUERCIK", "ISSUERNAME", "ISSUERTRADINGSYMBOL",
+           "RPTOWNERCIK", "RPTOWNERNAME", "RPTOWNER_TITLE", flags, "N_OWNERS", "ALL_OWNER_CIKS",
+           "DERIVATIVE", "TRANS_SK", "TRANS_DATE", "TRANS_CODE", "TRANS_ACQUIRED_DISP_CD", "TRANS_SHARES",
+           "TRANS_PRICEPERSHARE", "TRANS_VALUE", "SHRS_OWND_FOLWNG_TRANS", "DIRECT_INDIRECT_OWNERSHIP")
+setcolorder(insider, intersect(front, names(insider)))
+setorderv(insider, c("FILING_DATE", "ACCESSION_NUMBER", "DERIVATIVE", "TRANS_SK"))
+
+if (!is.null(SAVE_TO)) saveRDS(insider, SAVE_TO)
+
+say <- function(...) cat(paste0(...), "\n", sep = "")
+show <- function(x, caption = NULL, ...) {          # plain console-style table
+  if (!is.null(caption)) cat(caption, "\n", sep = "")
+  print(as.data.table(x), nrows = 1e5, row.names = FALSE)
+  cat("\n")
+}
+say(sprintf("insider: %s transactions from %s filings, %s to %s | %.1f GB in memory | built in %.1f min",
+            format(nrow(insider), big.mark = ","), format(uniqueN(insider$ACCESSION_NUMBER), big.mark = ","),
+            min(insider$FILING_DATE), max(insider$FILING_DATE),
+            as.numeric(object.size(insider)) / 1e9, as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+```
+
+## Summary
+
+```{r summary}
+yr <- insider[, .(Transactions = .N, Filings = uniqueN(ACCESSION_NUMBER),
+                  `Open-market buys (P)` = sum(TRANS_CODE == "P", na.rm = TRUE),
+                  `Open-market sales (S)` = sum(TRANS_CODE == "S", na.rm = TRUE)),
+              by = .(Year = as.character(year(FILING_DATE)))][order(Year)]
+show(yr)
+say("")
+if (!is.null(SAVE_TO)) say("Saved to ", normalizePath(SAVE_TO), ". Load with: insider <- readRDS(\"", SAVE_TO, "\")")
+```
